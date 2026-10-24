@@ -62,3 +62,4 @@ dart --packages=.dart_tool/package_config.json tool/pipeline_smoke.dart
 - 外部进程以独立参数列表启动（`runInShell: false`），路径含空格无需自行加引号。Windows Dart runtime 使用非 shell 子进程启动方式，避免弹出交互控制台窗口。
 - 每次应用运行的完整日志异步追加到 `%APPDATA%\\MediaIngest\\logs\\run_*.log`，约每秒 flush，退出时关闭；日志面板仅保留最近 1500 行，支持文本搜索和信息/警告/错误筛选，清屏不会删除文件，并可打开日志目录。凭证值会在展示和保存日志前做脱敏。此示例不负责自动刷新过期 STS Token，需要在任务开始前填入有效凭证。
 # dataUpdateTools
+# dataUpdateTools
