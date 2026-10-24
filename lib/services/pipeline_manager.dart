@@ -108,7 +108,7 @@ class PipelineManager {
         originStage: originStage,
       ),
     );
-    final terminalTaskStatuses = {'已复制', '已转码', '已上传', '失败', '已中止'};
+    final terminalTaskStatuses = {'已复制', '已转码', '已上传', '已清理', '失败', '已中止'};
     void setTask(
       String key,
       String name,
