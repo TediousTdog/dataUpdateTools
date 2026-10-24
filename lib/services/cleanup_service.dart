@@ -63,7 +63,13 @@ class CleanupService {
         final file = safeFiles[index];
         onTask(file, 0, '清理中');
         try {
-          await _deleteFile(file);
+          try {
+            await _deleteFile(file);
+          } on FileSystemException {
+            // 上传完成后若被杀毒软件或用户提前移走，清理目标已经达到；
+            // 仅在文件仍存在时才把它视为真正失败。
+            if (await file.exists()) rethrow;
+          }
           completed++;
           onTask(file, 1, '已清理');
           // 预留最后 5% 给空目录和 run 根目录收尾，避免文件刚删完便提前显示 100%。
@@ -92,7 +98,15 @@ class CleanupService {
 
     await gate.checkpoint();
     final directory = Directory(root);
-    if (await directory.exists()) await _deleteDirectory(directory);
+    if (await directory.exists()) {
+      try {
+        await _deleteDirectory(directory);
+      } on FileSystemException {
+        // 外部程序可能在 exists() 与递归删除之间先移走 run 目录；
+        // 若目标已消失，清理结果已经达到，否则保留实际删除错误。
+        if (await directory.exists()) rethrow;
+      }
+    }
     onProgress(1, completed, safeFiles.length);
   }
 

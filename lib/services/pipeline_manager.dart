@@ -17,13 +17,17 @@ class PipelineManager {
     CleanupService? cleanup,
     ProcessRunner? runner,
   }) : _copy = copy ?? CopyService(),
-       _runner = runner ?? ProcessRunner() {
+       _runner = runner ?? ProcessRunner(),
+       _useBulkUpload = oss == null {
     _ffmpeg = ffmpeg ?? FFmpegService(_runner);
     _oss = oss ?? OssService(_runner);
     _cleanup = cleanup ?? CleanupService();
   }
   final CopyService _copy;
   final ProcessRunner _runner;
+  // 默认 OssService 可以使用一次进程内的 --jobs/--parallel 批量上传。
+  // 注入的测试/自定义服务保持逐文件回调语义，避免替换服务时丢失控制能力。
+  final bool _useBulkUpload;
   late final FFmpegService _ffmpeg;
   late final OssService _oss;
   late final CleanupService _cleanup;
@@ -31,15 +35,26 @@ class PipelineManager {
   Stream<PipelineSnapshot> get events => _events.stream;
   PauseGate? _gate;
   LogCallback? _activeLog;
+  Completer<void>? _runCompletion;
+  Future<void>? _closeFuture;
+  AppConfig? _activeConfig;
+  bool _bulkUploadActive = false;
+  bool get bulkUploadActive => _bulkUploadActive;
   bool get running => _gate != null;
+  String? _lastLogError;
+  String? get lastLogError => _lastLogError;
   PipelineSnapshot _snapshot = const PipelineSnapshot();
   PipelineSnapshot get snapshot => _snapshot;
 
   void pause() {
     final gate = _gate;
     if (gate == null || gate.paused) return;
+    if (_bulkUploadActive) {
+      _writeLog(_activeLog, '当前 ossutil 批量上传不支持运行中暂停；可取消任务后切换为逐文件模式');
+      return;
+    }
     gate.pause();
-    _activeLog?.call('收到暂停请求；当前文件完成后暂停派发');
+    _writeLog(_activeLog, '收到暂停请求；当前文件完成后暂停派发');
     _emit(_snapshot.copyWith(paused: true));
   }
 
@@ -47,20 +62,32 @@ class PipelineManager {
     final gate = _gate;
     if (gate == null || !gate.paused) return;
     gate.resume();
-    _activeLog?.call('任务已恢复，继续派发文件');
+    _writeLog(_activeLog, '任务已恢复，继续派发文件');
     _emit(_snapshot.copyWith(paused: false));
   }
 
   Future<void> cancel() async {
-    if (_gate != null) _activeLog?.call('收到取消请求；正在终止活动进程');
+    if (_gate != null) {
+      _writeLog(_activeLog, '收到取消请求；正在终止活动进程');
+    }
     _gate?.cancel();
     await _runner.terminate();
   }
 
-  /// 页面退出时释放广播流；调用方应先等待当前 run() 收尾。
-  Future<void> close() async {
+  /// 取消活动任务并等待 worker 收尾后关闭事件流；可与 run() 并发调用。
+  Future<void> close() {
+    final existing = _closeFuture;
+    if (existing != null) return existing;
+    final operation = _closeNow();
+    _closeFuture = operation;
+    return operation;
+  }
+
+  Future<void> _closeNow() async {
     if (_events.isClosed) return;
     await cancel();
+    final completion = _runCompletion;
+    if (completion != null) await completion.future;
     await _events.close();
   }
 
@@ -70,9 +97,16 @@ class PipelineManager {
   }
 
   Future<void> run(AppConfig config, {required LogCallback log}) async {
+    if (_closeFuture != null || _events.isClosed) {
+      throw StateError('PipelineManager 已关闭');
+    }
     if (running) throw StateError('任务正在运行');
     final gate = _gate = PauseGate();
+    final completion = _runCompletion = Completer<void>();
     _activeLog = log;
+    _activeConfig = config;
+    _lastLogError = null;
+    final runTimer = Stopwatch()..start();
     const copyWeight = 0.30;
     const transcodeWeight = 0.30;
     final uploadWeight = config.deleteAfterUpload ? 0.35 : 0.40;
@@ -140,8 +174,12 @@ class PipelineManager {
       );
     }
 
-    void report(String line) => log(_redact(line, config));
+    void report(String line) => _writeLog(log, _redact(line, config));
     try {
+      // 授权码在流水线入口统一解析，后续各阶段只使用同一份有效配置。
+      // 解析失败会进入统一 failed 状态，且不会启动任何外部进程。
+      config = config.resolveAuthorization();
+      _activeConfig = config;
       // 所有路径在一次 run 开始时固定为绝对规范路径，避免工作目录变化或
       // 相对路径导致 run 目录、相对对象 key 和清理目标不一致。
       final source = p.normalize(p.absolute(config.sourcePath));
@@ -151,6 +189,14 @@ class PipelineManager {
       }
       final runId = DateTime.now().toUtc().microsecondsSinceEpoch;
       final runWorkspace = p.join(workspace, 'run_$runId');
+      report(
+        '任务配置：源=$source，工作区=$workspace，目标=oss://${config.bucket}/${config.prefix}',
+      );
+      report(
+        '并行参数：复制=${config.copyConcurrency}，转码=${config.transcodeConcurrency}，'
+        '上传 jobs=${config.uploadConcurrency}，分片 parallel=${config.multipartParallel}，'
+        '模式=${config.bulkUpload ? '批量' : '逐文件'}，清理=${config.deleteAfterUpload ? '开启' : '关闭'}',
+      );
       report('本次临时工作区：$runWorkspace');
       update(PipelineStage.copying, 0, message: '扫描中，正在读取目录');
       var copyCount = 0;
@@ -192,14 +238,29 @@ class PipelineManager {
         ),
       );
       final ext = config.videoExtensions.map((e) => e.toLowerCase()).toSet();
-      final videos = files
-          .where((f) => ext.contains(p.extension(f.path).toLowerCase()))
-          .toList();
+      // 转码是可选步骤。关闭时保留原始视频，后续仍会随工作区文件一起上传。
+      final videos = config.transcodeEnabled
+          ? files
+                .where((f) => ext.contains(p.extension(f.path).toLowerCase()))
+                .toList()
+          : <File>[];
+      final copiedFileIndex = {
+        for (var index = 0; index < files.length; index++)
+          files[index].path: index,
+      };
+      final videoFileIndexes = videos
+          .map((video) => copiedFileIndex[video.path]!)
+          .toList(growable: false);
+      taskStates.clear();
       update(
         PipelineStage.transcoding,
         transcodeStart,
         total: videos.length,
-        message: videos.isEmpty ? '没有待转码视频' : '准备转码 ${videos.length} 个视频',
+        message: !config.transcodeEnabled
+            ? '已跳过视频转码'
+            : videos.isEmpty
+            ? '没有待转码视频'
+            : '准备转码 ${videos.length} 个视频',
       );
       var nextVideo = 0, transcoded = 0;
       var stopTranscoding = false;
@@ -232,7 +293,7 @@ class PipelineManager {
           setTask(taskKey, name, null, '转码中');
           report('开始转码：$name');
           try {
-            await _ffmpeg.transcode(
+            final output = await _ffmpeg.transcode(
               video,
               executable: _resolveTool(config.ffmpegPath),
               argumentTemplate: config.ffmpegArgs,
@@ -260,6 +321,9 @@ class PipelineManager {
                 );
               },
             );
+            // 转码服务会删除原视频并返回新文件；更新扫描清单，后续直接复用
+            // 这份清单上传和清理，避免再对超大工作区做一次完整目录遍历。
+            files[videoFileIndexes[index]] = output;
             if (gate.cancelled) {
               setTask(taskKey, name, videoProgress[index], '已中止');
               return;
@@ -313,7 +377,14 @@ class PipelineManager {
       );
       if (gate.cancelled) throw const PipelineCancelledException();
       if (transcodeFailure != null) throw transcodeFailure!;
-      if (videos.isEmpty) {
+      if (!config.transcodeEnabled) {
+        update(
+          PipelineStage.transcoding,
+          transcodeStart + transcodeWeight,
+          total: 0,
+          message: '视频转码已关闭，保留原始视频',
+        );
+      } else if (videos.isEmpty) {
         update(
           PipelineStage.transcoding,
           transcodeStart + transcodeWeight,
@@ -322,34 +393,44 @@ class PipelineManager {
         );
       }
 
-      update(PipelineStage.uploading, uploadStart, message: '枚举本次工作区文件');
-      final workspaceFiles = await _listFiles(
-        runWorkspace,
-        gate: gate,
-        onProgress: (discovered) => update(
-          PipelineStage.uploading,
-          uploadStart,
-          message: '枚举中，已发现 $discovered 个文件',
-        ),
-      );
+      taskStates.clear();
+      final preferBulkUpload = _useBulkUpload && config.bulkUpload;
+      final workspaceFiles = preferBulkUpload
+          ? files
+          : await _listFiles(
+              runWorkspace,
+              gate: gate,
+              onProgress: (discovered) => update(
+                PipelineStage.uploading,
+                uploadStart,
+                message: '枚举中，已发现 $discovered 个文件',
+              ),
+            );
       final count = workspaceFiles.length;
+      final useBulkUpload = preferBulkUpload && count > 0;
       update(
         PipelineStage.uploading,
         uploadStart,
         total: count,
-        message: '统计 $count 个文件大小',
+        message: useBulkUpload
+            ? '批量上传准备中（jobs=${config.uploadConcurrency}，分片并行=${config.multipartParallel}）'
+            : '统计 $count 个文件大小',
       );
-      final uploadFileSizes = await _measureFileSizes(
-        workspaceFiles,
-        gate,
-        onProgress: (measured, total) => update(
-          PipelineStage.uploading,
-          uploadStart,
-          total: count,
-          done: measured,
-          message: '统计文件大小 $measured/$count（${_formatBytes(total)}）',
-        ),
-      );
+      // 批量模式由 ossutil 自己扫描目录，不再对每个文件额外调用 length()；
+      // 逐文件模式仍统计字节数，以准确加权 UI 总体进度。
+      final uploadFileSizes = useBulkUpload
+          ? List<int>.filled(count, 0)
+          : await _measureFileSizes(
+              workspaceFiles,
+              gate,
+              onProgress: (measured, total) => update(
+                PipelineStage.uploading,
+                uploadStart,
+                total: count,
+                done: measured,
+                message: '统计文件大小 $measured/$count（${_formatBytes(total)}）',
+              ),
+            );
       final totalUploadWorkUnits = uploadFileSizes.fold<int>(
         0,
         (sum, size) => sum + (size > 0 ? size : 1),
@@ -358,186 +439,304 @@ class PipelineManager {
         PipelineStage.uploading,
         uploadStart + (count == 0 ? uploadWeight : 0),
         total: count,
-        message: count == 0 ? '没有需要上传的文件' : 'OSS 上传',
+        file: null,
+        message: count == 0
+            ? '没有需要上传的文件'
+            : useBulkUpload
+            ? '批量上传中：jobs=${config.uploadConcurrency} × 分片并行=${config.multipartParallel}'
+            : 'OSS 上传',
       );
-      var next = 0, uploaded = 0;
-      var stopScheduling = false;
-      Object? uploadFailure;
-      final uploadProgress = List<double>.filled(count, 0);
-      final effectiveUploadProgress = List<double>.filled(count, 0);
-      var totalUploadProgress = 0.0;
-      double uploadFraction() {
-        if (count == 0) return 1;
-        return (totalUploadProgress / totalUploadWorkUnits)
-            .clamp(0, 1)
-            .toDouble();
-      }
-
-      double progressWeight(int index) =>
-          (uploadFileSizes[index] > 0 ? uploadFileSizes[index] : 1).toDouble();
-
-      final retryLimit = config.uploadRetries.clamp(0, 5).toInt();
-      Future<void> uploadWorker() async {
-        while (true) {
-          if (stopScheduling) return;
-          await gate.checkpoint();
-          if (stopScheduling) return;
-          final index = next++;
-          if (index >= count) return;
-          final file = workspaceFiles[index];
-          final name = p.relative(file.path, from: runWorkspace);
-          Object? fileError;
-          for (var attempt = 0; attempt <= retryLimit; attempt++) {
-            if (attempt > 0) {
-              if (stopScheduling) {
-                setTask('upload:$index', name, uploadProgress[index], '已中止');
-                return;
-              }
-              // 新尝试的单文件条从 0 重新显示；总体任务保持最高有效进度，避免回退。
-              uploadProgress[index] = 0;
-              setTask('upload:$index', name, null, '重试 $attempt/$retryLimit');
-              report(
-                '[$name] 上传失败：${_redact(fileError.toString(), config)}；准备第 $attempt/$retryLimit 次重试',
-              );
-              update(
-                PipelineStage.uploading,
-                uploadStart + uploadFraction() * uploadWeight,
-                file: 0,
-                name: name,
-                done: uploaded,
-                total: count,
-                message: '重试 $attempt/$retryLimit',
-              );
-              final delayMs = (300 * (1 << (attempt - 1)))
-                  .clamp(300, 5000)
-                  .toInt();
-              try {
-                await _waitForRetry(
-                  gate,
-                  Duration(milliseconds: delayMs),
-                  () => stopScheduling,
-                );
-              } on PipelineCancelledException {
-                setTask('upload:$index', name, null, '已中止');
-                return;
-              }
-              if (gate.cancelled) {
-                setTask('upload:$index', name, null, '已中止');
-                return;
-              }
-              if (stopScheduling) {
-                setTask('upload:$index', name, null, '已中止');
-                return;
-              }
-              setTask('upload:$index', name, null, '重试上传中');
-            } else {
-              setTask('upload:$index', name, null, '上传中');
-            }
+      var uploaded = 0;
+      if (useBulkUpload) {
+        final taskKey = 'upload:batch';
+        setTask(taskKey, '批量 OSS 上传（$count 个文件）', null, '上传中');
+        report(
+          '开始批量上传：$count 个文件，jobs=${config.uploadConcurrency}，parallel=${config.multipartParallel}',
+        );
+        var batchProgress = 0.0;
+        Object? batchFailure;
+        final retryLimit = config.uploadRetries.clamp(0, 5).toInt();
+        for (var attempt = 0; attempt <= retryLimit; attempt++) {
+          if (gate.cancelled) throw const PipelineCancelledException();
+          try {
+            _bulkUploadActive = true;
+            update(
+              PipelineStage.uploading,
+              uploadStart + batchProgress * uploadWeight,
+              file: null,
+              name: '批量 OSS 上传',
+              total: count,
+              message:
+                  '批量上传中：jobs=${config.uploadConcurrency} × 分片并行=${config.multipartParallel}',
+            );
+            late final int code;
             try {
-              await _oss.upload(
-                file,
+              code = await _oss.uploadTree(
+                workspace: runWorkspace,
                 config: config.copyWith(
                   ossutilPath: _resolveTool(config.ossutilPath),
                 ),
-                workspace: runWorkspace,
-                log: (line) => report('[$name] $line'),
+                log: (line) => report('[批量上传] $line'),
                 progress: (value, detail) {
-                  final stableValue = value
-                      .clamp(uploadProgress[index], 1)
-                      .toDouble();
-                  final effectiveValue =
-                      stableValue > effectiveUploadProgress[index]
-                      ? stableValue
-                      : effectiveUploadProgress[index];
-                  totalUploadProgress +=
-                      (effectiveValue - effectiveUploadProgress[index]) *
-                      progressWeight(index);
-                  uploadProgress[index] = stableValue;
-                  effectiveUploadProgress[index] = effectiveValue;
-                  final totalProgress = uploadFraction();
+                  final observed = value.clamp(0, 1).toDouble();
+                  if (observed > batchProgress) batchProgress = observed;
                   setTask(
-                    'upload:$index',
-                    name,
-                    stableValue,
+                    taskKey,
+                    '批量 OSS 上传（$count 个文件）',
+                    observed,
                     '上传中',
                     emit: false,
                   );
                   update(
                     PipelineStage.uploading,
-                    uploadStart + totalProgress * uploadWeight,
-                    file: stableValue,
-                    name: name,
-                    done: uploaded,
+                    uploadStart + batchProgress * uploadWeight,
+                    file: observed,
+                    name: '批量 OSS 上传',
+                    done: 0,
                     total: count,
-                    message: _redact(detail, config),
+                    message: '批量上传中：${_redact(detail, config)}',
                   );
                 },
               );
-              if (gate.cancelled || uploadFailure != null) {
-                setTask('upload:$index', name, uploadProgress[index], '已中止');
-                return;
-              }
-              if (stopScheduling && uploadFailure != null) {
-                setTask('upload:$index', name, uploadProgress[index], '已中止');
-                return;
-              }
-              fileError = null;
-              break;
-            } catch (error) {
-              fileError = error;
-              if (gate.cancelled) {
-                setTask('upload:$index', name, uploadProgress[index], '已中止');
-                return;
-              }
-              if (attempt >= retryLimit || stopScheduling) break;
+            } finally {
+              _bulkUploadActive = false;
             }
-          }
-          if (fileError != null) {
+            if (code != 0) {
+              throw StateError('ossutil 批量上传失败，退出码 $code');
+            }
+            batchFailure = null;
+            break;
+          } catch (error) {
+            if (gate.cancelled) {
+              setTask(taskKey, '批量 OSS 上传（$count 个文件）', null, '已中止');
+              throw const PipelineCancelledException();
+            }
+            batchFailure = error;
+            if (attempt >= retryLimit) break;
+            final retry = attempt + 1;
             setTask(
-              'upload:$index',
-              name,
-              uploadProgress[index],
-              gate.cancelled || uploadFailure != null ? '已中止' : '失败',
+              taskKey,
+              '批量 OSS 上传（$count 个文件）',
+              null,
+              '重试 $retry/$retryLimit',
             );
-            if (gate.cancelled) return;
-            if (uploadFailure == null) {
-              uploadFailure = fileError;
-              stopScheduling = true;
-              gate.resume();
-              await _runner.terminate();
-            }
-            return;
-          }
-          if (fileError == null) {
-            totalUploadProgress +=
-                (1 - effectiveUploadProgress[index]) * progressWeight(index);
-            uploadProgress[index] = 1;
-            effectiveUploadProgress[index] = 1;
-            uploaded++;
-            setTask('upload:$index', name, 1, '已上传', emit: false);
+            report(
+              '批量上传失败：${_redact(error.toString(), config)}；准备第 $retry/$retryLimit 次重试',
+            );
             update(
               PipelineStage.uploading,
-              uploadStart + uploadFraction() * uploadWeight,
-              file: 1,
-              name: name,
-              done: uploaded,
+              uploadStart + batchProgress * uploadWeight,
+              file: null,
+              name: '批量 OSS 上传',
+              done: 0,
               total: count,
-              message: '上传完成',
+              message: '重试 $retry/$retryLimit',
+            );
+            final delayMs = (300 * (1 << attempt)).clamp(300, 5000).toInt();
+            await _waitForRetry(
+              gate,
+              Duration(milliseconds: delayMs),
+              () => false,
             );
           }
         }
-      }
+        if (batchFailure != null) {
+          setTask(taskKey, '批量 OSS 上传（$count 个文件）', null, '失败');
+          throw batchFailure;
+        }
+        uploaded = count;
+        setTask(taskKey, '批量 OSS 上传（$count 个文件）', 1, '已上传', emit: false);
+        update(
+          PipelineStage.uploading,
+          uploadStart + uploadWeight,
+          file: 1,
+          name: '批量 OSS 上传',
+          done: uploaded,
+          total: count,
+          message: '上传完成',
+        );
+      } else {
+        var next = 0;
+        var stopScheduling = false;
+        Object? uploadFailure;
+        final uploadProgress = List<double>.filled(count, 0);
+        final effectiveUploadProgress = List<double>.filled(count, 0);
+        var totalUploadProgress = 0.0;
+        double uploadFraction() {
+          if (count == 0) return 1;
+          return (totalUploadProgress / totalUploadWorkUnits)
+              .clamp(0, 1)
+              .toDouble();
+        }
 
-      await Future.wait(
-        List.generate(
-          config.uploadConcurrency.clamp(1, 32).toInt(),
-          (_) => uploadWorker(),
-        ),
-      );
-      if (gate.cancelled) throw const PipelineCancelledException();
-      if (uploadFailure != null) throw uploadFailure!;
+        double progressWeight(int index) =>
+            (uploadFileSizes[index] > 0 ? uploadFileSizes[index] : 1)
+                .toDouble();
+
+        final retryLimit = config.uploadRetries.clamp(0, 5).toInt();
+        Future<void> uploadWorker() async {
+          while (true) {
+            if (stopScheduling) return;
+            await gate.checkpoint();
+            if (stopScheduling) return;
+            final index = next++;
+            if (index >= count) return;
+            final file = workspaceFiles[index];
+            final name = p.relative(file.path, from: runWorkspace);
+            Object? fileError;
+            for (var attempt = 0; attempt <= retryLimit; attempt++) {
+              if (attempt > 0) {
+                if (stopScheduling) {
+                  setTask('upload:$index', name, uploadProgress[index], '已中止');
+                  return;
+                }
+                // 新尝试的单文件条从 0 重新显示；总体任务保持最高有效进度，避免回退。
+                uploadProgress[index] = 0;
+                setTask('upload:$index', name, null, '重试 $attempt/$retryLimit');
+                report(
+                  '[$name] 上传失败：${_redact(fileError.toString(), config)}；准备第 $attempt/$retryLimit 次重试',
+                );
+                update(
+                  PipelineStage.uploading,
+                  uploadStart + uploadFraction() * uploadWeight,
+                  file: 0,
+                  name: name,
+                  done: uploaded,
+                  total: count,
+                  message: '重试 $attempt/$retryLimit',
+                );
+                final delayMs = (300 * (1 << (attempt - 1)))
+                    .clamp(300, 5000)
+                    .toInt();
+                try {
+                  await _waitForRetry(
+                    gate,
+                    Duration(milliseconds: delayMs),
+                    () => stopScheduling,
+                  );
+                } on PipelineCancelledException {
+                  setTask('upload:$index', name, null, '已中止');
+                  return;
+                }
+                if (gate.cancelled) {
+                  setTask('upload:$index', name, null, '已中止');
+                  return;
+                }
+                if (stopScheduling) {
+                  setTask('upload:$index', name, null, '已中止');
+                  return;
+                }
+                setTask('upload:$index', name, null, '重试上传中');
+              } else {
+                setTask('upload:$index', name, null, '上传中');
+              }
+              try {
+                await _oss.upload(
+                  file,
+                  config: config.copyWith(
+                    ossutilPath: _resolveTool(config.ossutilPath),
+                  ),
+                  workspace: runWorkspace,
+                  log: (line) => report('[$name] $line'),
+                  progress: (value, detail) {
+                    final stableValue = value
+                        .clamp(uploadProgress[index], 1)
+                        .toDouble();
+                    final effectiveValue =
+                        stableValue > effectiveUploadProgress[index]
+                        ? stableValue
+                        : effectiveUploadProgress[index];
+                    totalUploadProgress +=
+                        (effectiveValue - effectiveUploadProgress[index]) *
+                        progressWeight(index);
+                    uploadProgress[index] = stableValue;
+                    effectiveUploadProgress[index] = effectiveValue;
+                    final totalProgress = uploadFraction();
+                    setTask(
+                      'upload:$index',
+                      name,
+                      stableValue,
+                      '上传中',
+                      emit: false,
+                    );
+                    update(
+                      PipelineStage.uploading,
+                      uploadStart + totalProgress * uploadWeight,
+                      file: stableValue,
+                      name: name,
+                      done: uploaded,
+                      total: count,
+                      message: _redact(detail, config),
+                    );
+                  },
+                );
+                if (gate.cancelled || uploadFailure != null) {
+                  setTask('upload:$index', name, uploadProgress[index], '已中止');
+                  return;
+                }
+                if (stopScheduling && uploadFailure != null) {
+                  setTask('upload:$index', name, uploadProgress[index], '已中止');
+                  return;
+                }
+                fileError = null;
+                break;
+              } catch (error) {
+                fileError = error;
+                if (gate.cancelled) {
+                  setTask('upload:$index', name, uploadProgress[index], '已中止');
+                  return;
+                }
+                if (attempt >= retryLimit || stopScheduling) break;
+              }
+            }
+            if (fileError != null) {
+              setTask(
+                'upload:$index',
+                name,
+                uploadProgress[index],
+                gate.cancelled || uploadFailure != null ? '已中止' : '失败',
+              );
+              if (gate.cancelled) return;
+              if (uploadFailure == null) {
+                uploadFailure = fileError;
+                stopScheduling = true;
+                gate.resume();
+                await _runner.terminate();
+              }
+              return;
+            }
+            if (fileError == null) {
+              totalUploadProgress +=
+                  (1 - effectiveUploadProgress[index]) * progressWeight(index);
+              uploadProgress[index] = 1;
+              effectiveUploadProgress[index] = 1;
+              uploaded++;
+              setTask('upload:$index', name, 1, '已上传', emit: false);
+              update(
+                PipelineStage.uploading,
+                uploadStart + uploadFraction() * uploadWeight,
+                file: 1,
+                name: name,
+                done: uploaded,
+                total: count,
+                message: '上传完成',
+              );
+            }
+          }
+        }
+
+        await Future.wait(
+          List.generate(
+            config.uploadConcurrency.clamp(1, 32).toInt(),
+            (_) => uploadWorker(),
+          ),
+        );
+        if (gate.cancelled) throw const PipelineCancelledException();
+        if (uploadFailure != null) throw uploadFailure!;
+      }
       if (config.deleteAfterUpload) {
         await gate.checkpoint();
+        taskStates.clear();
         update(PipelineStage.cleaning, cleanupStart, message: '清理工作区');
         final cleanupFiles = workspaceFiles;
         update(
@@ -576,7 +775,7 @@ class PipelineManager {
         );
       }
       update(PipelineStage.completed, 1, message: '任务完成');
-      report('任务完成：已上传 $uploaded 个文件');
+      report('任务完成：已上传 $uploaded 个文件，耗时 ${_formatDuration(runTimer.elapsed)}');
     } on PipelineCancelledException {
       update(
         PipelineStage.cancelled,
@@ -596,18 +795,23 @@ class PipelineManager {
         report('任务已取消');
         return;
       }
+      final safeError = _redact(error.toString(), config);
       update(
         PipelineStage.failed,
         _snapshot.overall,
-        message: error.toString(),
+        message: safeError,
         originStage: _snapshot.stage,
       );
-      report('任务失败：$error');
-      report(stack.toString());
+      report('任务失败（耗时 ${_formatDuration(runTimer.elapsed)}）：$safeError');
+      report(_redact(stack.toString(), config));
       rethrow;
     } finally {
       _gate = null;
+      _bulkUploadActive = false;
       _activeLog = null;
+      _activeConfig = null;
+      if (!completion.isCompleted) completion.complete();
+      if (identical(_runCompletion, completion)) _runCompletion = null;
     }
   }
 
@@ -659,10 +863,30 @@ class PipelineManager {
 
   String _redact(String value, AppConfig config) {
     var safe = value;
-    for (final secret in [config.accessKeySecret, config.securityToken]) {
+    final secrets = [
+      config.accessKeyId,
+      config.accessKeySecret,
+      config.securityToken,
+      config.authorizationCode,
+    ]..sort((left, right) => right.length.compareTo(left.length));
+    for (final secret in secrets) {
       if (secret.isNotEmpty) safe = safe.replaceAll(secret, '***');
     }
     return safe;
+  }
+
+  void _writeLog(LogCallback? callback, String message) {
+    if (callback == null) return;
+    try {
+      callback(message);
+    } catch (error) {
+      // 日志 sink 故障不能阻止 pause/resume/cancel，也不能把成功的文件
+      // 传输误判成失败；把同步回调故障单独暴露给 UI 诊断区。
+      _lastLogError ??= _redact(
+        error.toString(),
+        _activeConfig ?? const AppConfig(),
+      );
+    }
   }
 
   Future<void> _waitForRetry(
@@ -709,5 +933,15 @@ class PipelineManager {
       unit++;
     }
     return '${value.toStringAsFixed(unit == 0 ? 0 : 1)} ${units[unit]}';
+  }
+
+  String _formatDuration(Duration duration) {
+    final seconds = duration.inSeconds;
+    if (seconds < 60) return '${seconds}s';
+    final minutes = seconds ~/ 60;
+    final remainingSeconds = seconds % 60;
+    if (minutes < 60) return '${minutes}m ${remainingSeconds}s';
+    final hours = minutes ~/ 60;
+    return '${hours}h ${minutes % 60}m ${remainingSeconds}s';
   }
 }

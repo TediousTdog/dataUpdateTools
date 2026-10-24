@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
 import '../models/app_config.dart';
+import '../models/oss_authorization.dart';
 import '../services/config_repository.dart';
 import '../services/log_store.dart';
 import '../services/log_severity.dart';
@@ -47,11 +49,41 @@ class _PipelinePageState extends State<PipelinePage> {
   AppConfig _config = const AppConfig();
   bool _loading = true;
   String? _logFilePath;
-  String? _logSaveError;
+  String? _logSessionError;
+  String? _logAppendError;
+  String? _renderedLogError;
   String? _actionError;
   String _logSearchQuery = '';
   _LogFilter _logFilter = _LogFilter.all;
   bool _disposed = false;
+  bool _starting = false;
+  bool _showAdvanced = false;
+
+  static const _advancedKeys = <String>{
+    'endpoint',
+    'accessKeyId',
+    'accessKeySecret',
+    'securityToken',
+    'ffmpegPath',
+    'ossutilPath',
+    'ffmpegArgs',
+    'videoExtensions',
+    'outputExtension',
+    'multipartParallel',
+    'bigFileThresholdMb',
+    'partSizeMb',
+    'uploadRetries',
+    'transcodeConcurrency',
+    'copyConcurrency',
+    'cleanupConcurrency',
+    'ossExtraArgs',
+  };
+
+  static const _transcodePresets = <String, String>{
+    '硬件加速（推荐）': '-c:v h264_nvenc -preset fast -c:a copy',
+    '兼容模式（CPU）': '-c:v libx264 -preset veryfast -crf 23 -c:a aac',
+    '高质量（CPU）': '-c:v libx264 -preset medium -crf 18 -c:a aac',
+  };
 
   static const _fields = <(String, String, bool)>[
     ('sourcePath', '读卡器源目录', false),
@@ -59,6 +91,7 @@ class _PipelinePageState extends State<PipelinePage> {
     ('bucket', 'OSS Bucket', false),
     ('prefix', 'OSS 对象前缀', false),
     ('endpoint', 'OSS Endpoint', false),
+    ('authorizationCode', 'OSS 授权码（Base64 JSON）', true),
     ('accessKeyId', 'AccessKey ID', false),
     ('accessKeySecret', 'AccessKey Secret', true),
     ('securityToken', 'STS Security Token', true),
@@ -68,6 +101,9 @@ class _PipelinePageState extends State<PipelinePage> {
     ('videoExtensions', '转码视频后缀（逗号分隔）', false),
     ('outputExtension', '转码输出后缀', false),
     ('uploadConcurrency', '上传并发数', false),
+    ('multipartParallel', '单文件分片并行数', false),
+    ('bigFileThresholdMb', '大文件阈值（MB）', false),
+    ('partSizeMb', '分片大小（MB）', false),
     ('uploadRetries', '上传失败重试次数', false),
     ('transcodeConcurrency', '转码并发数', false),
     ('copyConcurrency', '复制并发数', false),
@@ -108,7 +144,7 @@ class _PipelinePageState extends State<PipelinePage> {
       await _logStore.startSession();
       _logFilePath = _logStore.filePath;
     } catch (error) {
-      _logSaveError = error.toString();
+      _logSessionError = '无法启动日志会话：$error';
     }
     try {
       _config = await _repo.load();
@@ -132,6 +168,7 @@ class _PipelinePageState extends State<PipelinePage> {
     'bucket' => c.bucket,
     'prefix' => c.prefix,
     'endpoint' => c.endpoint,
+    'authorizationCode' => c.authorizationCode,
     'accessKeyId' => c.accessKeyId,
     'accessKeySecret' => c.accessKeySecret,
     'securityToken' => c.securityToken,
@@ -141,6 +178,9 @@ class _PipelinePageState extends State<PipelinePage> {
     'videoExtensions' => c.videoExtensions.join(', '),
     'outputExtension' => c.outputExtension,
     'uploadConcurrency' => '${c.uploadConcurrency}',
+    'multipartParallel' => '${c.multipartParallel}',
+    'bigFileThresholdMb' => '${c.bigFileThresholdMb}',
+    'partSizeMb' => '${c.partSizeMb}',
     'uploadRetries' => '${c.uploadRetries}',
     'transcodeConcurrency' => '${c.transcodeConcurrency}',
     'copyConcurrency' => '${c.copyConcurrency}',
@@ -149,33 +189,94 @@ class _PipelinePageState extends State<PipelinePage> {
     _ => '',
   };
 
-  AppConfig _readForm() => _config.copyWith(
-    sourcePath: _text('sourcePath'),
-    workspacePath: _text('workspacePath'),
-    bucket: _text('bucket'),
-    prefix: _text('prefix'),
-    endpoint: _text('endpoint'),
-    accessKeyId: _text('accessKeyId'),
-    accessKeySecret: _text('accessKeySecret'),
-    securityToken: _text('securityToken'),
-    ffmpegPath: _text('ffmpegPath'),
-    ossutilPath: _text('ossutilPath'),
-    ffmpegArgs: _text('ffmpegArgs'),
-    videoExtensions: _text('videoExtensions')
-        .split(',')
-        .map((e) => e.trim().toLowerCase())
-        .where((e) => e.isNotEmpty)
-        .map((e) => e.startsWith('.') ? e : '.$e')
-        .toList(),
-    outputExtension: _text('outputExtension'),
-    uploadConcurrency: int.tryParse(_text('uploadConcurrency')) ?? 1,
-    uploadRetries: int.tryParse(_text('uploadRetries')) ?? 0,
-    transcodeConcurrency: int.tryParse(_text('transcodeConcurrency')) ?? 1,
-    copyConcurrency: int.tryParse(_text('copyConcurrency')) ?? 1,
-    cleanupConcurrency: int.tryParse(_text('cleanupConcurrency')) ?? 1,
-    ossExtraArgs: _text('ossExtraArgs'),
-  );
+  AppConfig _readForm() {
+    final authorizationCode = _text('authorizationCode');
+    final useAuthorizationCode = authorizationCode.isNotEmpty;
+    return _config.copyWith(
+      sourcePath: _text('sourcePath'),
+      workspacePath: _text('workspacePath'),
+      // 若使用单个授权码，保存配置时不再将旧的手工凭证重复写入 JSON；
+      // 清除授权码后，界面中的手工值仍可继续作为兼容模式使用。
+      bucket: useAuthorizationCode ? '' : _text('bucket'),
+      prefix: useAuthorizationCode ? '' : _text('prefix'),
+      endpoint: useAuthorizationCode ? '' : _text('endpoint'),
+      authorizationCode: authorizationCode,
+      accessKeyId: useAuthorizationCode ? '' : _text('accessKeyId'),
+      accessKeySecret: useAuthorizationCode ? '' : _text('accessKeySecret'),
+      securityToken: useAuthorizationCode ? '' : _text('securityToken'),
+      ffmpegPath: _text('ffmpegPath'),
+      ossutilPath: _text('ossutilPath'),
+      ffmpegArgs: _text('ffmpegArgs'),
+      videoExtensions: _text('videoExtensions')
+          .split(',')
+          .map((e) => e.trim().toLowerCase())
+          .where((e) => e.isNotEmpty)
+          .map((e) => e.startsWith('.') ? e : '.$e')
+          .toList(),
+      outputExtension: _text('outputExtension'),
+      uploadConcurrency: int.tryParse(_text('uploadConcurrency')) ?? 1,
+      multipartParallel: int.tryParse(_text('multipartParallel')) ?? 1,
+      bigFileThresholdMb: int.tryParse(_text('bigFileThresholdMb')) ?? 1,
+      partSizeMb: int.tryParse(_text('partSizeMb')) ?? 1,
+      uploadRetries: int.tryParse(_text('uploadRetries')) ?? 0,
+      transcodeConcurrency: int.tryParse(_text('transcodeConcurrency')) ?? 1,
+      copyConcurrency: int.tryParse(_text('copyConcurrency')) ?? 1,
+      cleanupConcurrency: int.tryParse(_text('cleanupConcurrency')) ?? 1,
+      ossExtraArgs: _text('ossExtraArgs'),
+    );
+  }
+
   String _text(String key) => _controllers[key]?.text.trim() ?? '';
+
+  Future<void> _pickDirectory(String key, String title) async {
+    if (_manager.running || _starting) return;
+    final selected = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: title,
+      lockParentWindow: true,
+    );
+    if (!mounted || selected == null || selected.trim().isEmpty) return;
+    _controllers[key]?.value = TextEditingValue(
+      text: selected,
+      selection: TextSelection.collapsed(offset: selected.length),
+    );
+    setState(() {});
+  }
+
+  Future<void> _pickExecutable(String key, String title) async {
+    if (_manager.running || _starting) return;
+    final result = await FilePicker.platform.pickFiles(
+      dialogTitle: title,
+      type: FileType.custom,
+      allowedExtensions: const ['exe'],
+      allowMultiple: false,
+      lockParentWindow: true,
+    );
+    final selected = result?.files.single.path;
+    if (!mounted || selected == null || selected.trim().isEmpty) return;
+    _controllers[key]?.value = TextEditingValue(
+      text: selected,
+      selection: TextSelection.collapsed(offset: selected.length),
+    );
+    setState(() {});
+  }
+
+  String? _presetFor(String args) {
+    for (final entry in _transcodePresets.entries) {
+      if (entry.value == args) return entry.key;
+    }
+    return null;
+  }
+
+  String _authorizationPreview() {
+    final code = _text('authorizationCode');
+    if (code.isEmpty) return '授权码留空时，使用下方手动 OSS 配置。';
+    try {
+      final auth = OssAuthorization.parse(code);
+      return '已解析：${auth.bucket}/${auth.prefix}\n${auth.endpoint}';
+    } on FormatException catch (error) {
+      return '授权码无效：${error.message}';
+    }
+  }
 
   List<String> get _visibleLogs {
     final query = _logSearchQuery.toLowerCase();
@@ -216,54 +317,79 @@ class _PipelinePageState extends State<PipelinePage> {
   }
 
   Future<void> _start() async {
+    if (_starting || _manager.running) return;
     if (!(_formKey.currentState?.validate() ?? false)) return;
-    _config = _readForm();
-    const requiredFields = <String, String>{
-      'sourcePath': '源目录',
-      'workspacePath': '本地工作区',
-      'bucket': 'OSS Bucket',
-      'endpoint': 'OSS Endpoint',
-      'accessKeyId': 'AccessKey ID',
-      'accessKeySecret': 'AccessKey Secret',
-      'securityToken': 'STS Security Token',
-      'ossutilPath': 'ossutil 程序路径',
-    };
-    final missing = requiredFields.entries
-        .where((field) => _text(field.key).isEmpty)
-        .map((field) => field.value)
-        .toList();
-    if (missing.isNotEmpty) {
-      final message = '任务未启动，缺少配置：${missing.join('、')}';
-      _append(message);
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(message)));
-      }
-      return;
-    }
+    if (mounted) setState(() => _starting = true);
     try {
-      await _repo.save(_config);
-      if (mounted) setState(() => _actionError = null);
-    } catch (error) {
-      _actionError = '任务未启动，配置保存失败：$error';
-      _append(_actionError!);
-      if (mounted) {
-        setState(() {});
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(_actionError!)));
+      _config = _readForm();
+      final requiredFields = <String, String>{
+        'sourcePath': '源目录',
+        'workspacePath': '本地工作区',
+        'ossutilPath': 'ossutil 程序路径',
+      };
+      if (_text('authorizationCode').isEmpty) {
+        requiredFields.addAll(const {
+          'bucket': 'OSS Bucket',
+          'endpoint': 'OSS Endpoint',
+          'accessKeyId': 'AccessKey ID',
+          'accessKeySecret': 'AccessKey Secret',
+        });
       }
-      return;
-    }
-    try {
-      final run = _manager.run(_config, log: _append);
-      _activeRun = run;
-      await run;
-    } catch (_) {
-      // 具体错误已经写入全局日志，避免再弹出重复提示。
+      final missing = requiredFields.entries
+          .where((field) => _text(field.key).isEmpty)
+          .map((field) => field.value)
+          .toList();
+      if (missing.isNotEmpty) {
+        final message = '任务未启动，缺少配置：${missing.join('、')}';
+        _append(message);
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(message)));
+        }
+        return;
+      }
+
+      try {
+        // 在写入配置/启动流水线前先解析一次，错误会直接反馈到界面；
+        // PipelineManager 仍会再次解析，以保证非 UI 调用也具备同样保护。
+        _config.resolveAuthorization();
+      } on FormatException catch (error) {
+        final message = '授权码解析失败：${error.message}';
+        _append(message);
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(message)));
+        }
+        return;
+      }
+
+      try {
+        await _repo.save(_config);
+        if (mounted) setState(() => _actionError = null);
+      } catch (error) {
+        _actionError = '任务未启动，配置保存失败：$error';
+        _append(_actionError!);
+        if (mounted) {
+          setState(() {});
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(_actionError!)));
+        }
+        return;
+      }
+
+      try {
+        final run = _manager.run(_config, log: _append);
+        _activeRun = run;
+        await run;
+      } catch (_) {
+        // 具体错误已经写入全局日志，避免再弹出重复提示。
+      }
     } finally {
       _activeRun = null;
+      if (mounted) setState(() => _starting = false);
     }
   }
 
@@ -273,23 +399,32 @@ class _PipelinePageState extends State<PipelinePage> {
     if (mounted && !_disposed) _pendingLogs.add(entry);
     unawaited(
       _logStore.append(entry).catchError((Object error) {
-        if (mounted) setState(() => _logSaveError = error.toString());
+        _logAppendError = '日志追加失败：$error';
+        if (mounted) setState(() {});
       }),
     );
   }
 
   void _flushLogUi() {
     if (!mounted) return;
-    final saveError = _logStore.lastError?.toString();
-    final logStateChanged = saveError != null && saveError != _logSaveError;
+    final logErrors = <String>[
+      ?_logSessionError,
+      ?_logAppendError,
+      if (_logStore.lastError != null) '日志文件写入失败：${_logStore.lastError}',
+      if (_manager.lastLogError != null) '日志回调失败：${_manager.lastLogError}',
+    ];
+    final logError = logErrors.isEmpty ? null : logErrors.join('\n');
+    final logStateChanged = logError != _renderedLogError;
     if (_pendingLogs.isEmpty) {
-      if (logStateChanged) setState(() => _logSaveError = saveError);
+      if (logStateChanged) {
+        setState(() => _renderedLogError = logError);
+      }
       return;
     }
     final batch = List<String>.from(_pendingLogs);
     _pendingLogs.clear();
     setState(() {
-      if (logStateChanged) _logSaveError = saveError;
+      if (logStateChanged) _renderedLogError = logError;
       _logs.addAll(batch);
       if (_logs.length > 1500) _logs.removeRange(0, _logs.length - 1500);
     });
@@ -371,13 +506,14 @@ class _PipelinePageState extends State<PipelinePage> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
     final running = _manager.running;
+    final busy = running || _starting;
     return Scaffold(
       appBar: AppBar(
         title: const Text('媒体归档工作台'),
         actions: [
           IconButton(
             tooltip: '保存配置',
-            onPressed: running ? null : _save,
+            onPressed: busy ? null : _save,
             icon: const Icon(Icons.save_outlined),
           ),
         ],
@@ -398,86 +534,300 @@ class _PipelinePageState extends State<PipelinePage> {
     );
   }
 
-  Widget _configPanel() => Card(
-    elevation: 0,
-    child: Form(
-      key: _formKey,
-      child: Scrollbar(
-        child: GridView.builder(
-          padding: const EdgeInsets.all(16),
-          itemCount: _fields.length + 1,
-          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-            maxCrossAxisExtent: 460,
-            mainAxisExtent: 76,
-            crossAxisSpacing: 14,
-            mainAxisSpacing: 6,
-          ),
-          itemBuilder: (context, index) {
-            if (index == _fields.length) {
-              return Align(
-                alignment: Alignment.centerLeft,
-                child: Row(
-                  children: [
-                    const Text('上传成功后删除工作区'),
-                    const SizedBox(width: 8),
-                    Switch(
-                      value: _config.deleteAfterUpload,
-                      onChanged: _manager.running
-                          ? null
-                          : (value) => setState(
-                              () => _config = _config.copyWith(
-                                deleteAfterUpload: value,
-                              ),
-                            ),
+  Widget _configPanel() {
+    final busy = _manager.running || _starting;
+    final visibleFields = _fields
+        .where((field) => _showAdvanced || !_advancedKeys.contains(field.$1))
+        .toList(growable: false);
+    final specialCount = 6;
+    return Card(
+      elevation: 0,
+      child: Form(
+        key: _formKey,
+        child: Scrollbar(
+          child: GridView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: visibleFields.length + specialCount,
+            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+              maxCrossAxisExtent: 460,
+              mainAxisExtent: 76,
+              crossAxisSpacing: 14,
+              mainAxisSpacing: 6,
+            ),
+            itemBuilder: (context, index) {
+              final specialIndex = index - visibleFields.length;
+              if (specialIndex == 0) {
+                return Align(
+                  alignment: Alignment.centerLeft,
+                  child: Row(
+                    children: [
+                      const Icon(Icons.movie_outlined, size: 20),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text('视频转码', overflow: TextOverflow.ellipsis),
+                      ),
+                      Tooltip(
+                        message: '关闭后保留原始视频，只执行复制和上传',
+                        child: Switch(
+                          value: _config.transcodeEnabled,
+                          onChanged: busy
+                              ? null
+                              : (value) => setState(
+                                  () => _config = _config.copyWith(
+                                    transcodeEnabled: value,
+                                  ),
+                                ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
+              if (specialIndex == 1) {
+                return Align(
+                  alignment: Alignment.centerLeft,
+                  child: Row(
+                    children: [
+                      const Icon(Icons.cloud_upload_outlined, size: 20),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text('高吞吐批量上传', overflow: TextOverflow.ellipsis),
+                      ),
+                      const SizedBox(width: 8),
+                      Tooltip(
+                        message: '推荐开启：由 ossutil 统一管理大量文件的并发上传',
+                        child: Switch(
+                          value: _config.bulkUpload,
+                          onChanged: busy
+                              ? null
+                              : (value) => setState(
+                                  () => _config = _config.copyWith(
+                                    bulkUpload: value,
+                                  ),
+                                ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
+              if (specialIndex == 2) {
+                return Align(
+                  alignment: Alignment.centerLeft,
+                  child: Row(
+                    children: [
+                      const Icon(Icons.delete_sweep_outlined, size: 20),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text(
+                          '上传成功后清理临时文件',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Tooltip(
+                        message: '只删除本次任务的临时工作区，不会删除源盘文件',
+                        child: Switch(
+                          value: _config.deleteAfterUpload,
+                          onChanged: busy
+                              ? null
+                              : (value) => setState(
+                                  () => _config = _config.copyWith(
+                                    deleteAfterUpload: value,
+                                  ),
+                                ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
+              if (specialIndex == 3) {
+                final selectedPreset = _presetFor(_text('ffmpegArgs'));
+                return DropdownButtonFormField<String>(
+                  initialValue: selectedPreset,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    labelText: '视频编码方案',
+                    helperText: '普通用户直接选择方案即可，也可在高级设置中自定义参数',
+                  ),
+                  items: _transcodePresets.keys
+                      .map(
+                        (label) => DropdownMenuItem<String>(
+                          value: label,
+                          child: Text(label),
+                        ),
+                      )
+                      .toList(growable: false),
+                  onChanged: busy || !_config.transcodeEnabled
+                      ? null
+                      : (label) {
+                          final args = label == null
+                              ? null
+                              : _transcodePresets[label];
+                          if (args == null) return;
+                          _controllers['ffmpegArgs']?.text = args;
+                          setState(() {});
+                        },
+                );
+              }
+              if (specialIndex == 4) {
+                return Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    onPressed: busy
+                        ? null
+                        : () => setState(() => _showAdvanced = !_showAdvanced),
+                    icon: Icon(
+                      _showAdvanced ? Icons.expand_less : Icons.tune_outlined,
                     ),
-                  ],
+                    label: Text(_showAdvanced ? '收起高级设置' : '显示高级设置'),
+                  ),
+                );
+              }
+              if (specialIndex == 5) {
+                final hasCode = _text('authorizationCode').isNotEmpty;
+                return Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    _authorizationPreview(),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color:
+                          hasCode && _authorizationPreview().startsWith('授权码无效')
+                          ? Theme.of(context).colorScheme.error
+                          : Theme.of(context).colorScheme.primary,
+                    ),
+                  ),
+                );
+              }
+              final (key, label, secret) = visibleFields[index];
+              final numeric =
+                  key == 'uploadConcurrency' ||
+                  key == 'multipartParallel' ||
+                  key == 'bigFileThresholdMb' ||
+                  key == 'partSizeMb' ||
+                  key == 'uploadRetries' ||
+                  key == 'transcodeConcurrency' ||
+                  key == 'copyConcurrency' ||
+                  key == 'cleanupConcurrency';
+              return TextFormField(
+                controller: _controllers[key],
+                obscureText: secret,
+                // Flutter 的 obscureText 字段必须保持单行；授权码可直接粘贴，
+                // 内部换行会由解析器忽略。
+                maxLines: 1,
+                keyboardType: numeric
+                    ? TextInputType.number
+                    : TextInputType.text,
+                enabled:
+                    !busy &&
+                    !(_text('authorizationCode').isNotEmpty &&
+                        const {
+                          'bucket',
+                          'prefix',
+                          'endpoint',
+                          'accessKeyId',
+                          'accessKeySecret',
+                          'securityToken',
+                        }.contains(key)),
+                onChanged: key == 'authorizationCode'
+                    ? (_) => setState(() {})
+                    : null,
+                validator: (value) {
+                  if (key == 'authorizationCode' &&
+                      (value?.trim().isNotEmpty ?? false)) {
+                    try {
+                      OssAuthorization.parse(value!);
+                    } on FormatException catch (error) {
+                      return error.message;
+                    }
+                  }
+                  if (key == 'outputExtension') {
+                    final extension = value?.trim() ?? '';
+                    final normalized = extension.startsWith('.')
+                        ? extension
+                        : '.$extension';
+                    if (!RegExp(
+                      r'^\.[a-zA-Z0-9]{1,10}$',
+                    ).hasMatch(normalized)) {
+                      return '请输入有效的扩展名，例如 .mp4';
+                    }
+                  }
+                  if (numeric) {
+                    final parsed = int.tryParse(value ?? '');
+                    final isRetries = key == 'uploadRetries';
+                    final min = isRetries ? 0 : 1;
+                    final max = key == 'transcodeConcurrency'
+                        ? 8
+                        : key == 'uploadRetries'
+                        ? 5
+                        : key == 'multipartParallel'
+                        ? 128
+                        : key == 'bigFileThresholdMb'
+                        ? 10240
+                        : key == 'partSizeMb'
+                        ? 1024
+                        : key == 'uploadConcurrency'
+                        ? 128
+                        : 32;
+                    if (parsed == null || parsed < min || parsed > max) {
+                      return '请输入 $min 到 $max 之间的整数';
+                    }
+                  }
+                  return null;
+                },
+                decoration: InputDecoration(
+                  labelText: label,
+                  helperText: switch (key) {
+                    'sourcePath' => '读卡器或外接磁盘中的照片/视频目录',
+                    'workspacePath' => '本机临时空间，需要足够的磁盘容量',
+                    'authorizationCode' => '粘贴服务方提供的一整段授权码即可',
+                    'bucket' => '授权码模式下会自动填充',
+                    'prefix' => '可选；用于整理到 OSS 子目录',
+                    'uploadConcurrency' => '默认 10；网络和磁盘较快时可提高',
+                    _ => null,
+                  },
+                  suffixIcon: switch (key) {
+                    'sourcePath' => IconButton(
+                      tooltip: '选择源目录',
+                      onPressed: busy
+                          ? null
+                          : () => _pickDirectory(key, '选择读卡器源目录'),
+                      icon: const Icon(Icons.folder_open_outlined),
+                    ),
+                    'workspacePath' => IconButton(
+                      tooltip: '选择工作区目录',
+                      onPressed: busy
+                          ? null
+                          : () => _pickDirectory(key, '选择本地工作区'),
+                      icon: const Icon(Icons.folder_open_outlined),
+                    ),
+                    'ffmpegPath' => IconButton(
+                      tooltip: '选择 ffmpeg.exe',
+                      onPressed: busy
+                          ? null
+                          : () => _pickExecutable(key, '选择 ffmpeg.exe'),
+                      icon: const Icon(Icons.video_file_outlined),
+                    ),
+                    'ossutilPath' => IconButton(
+                      tooltip: '选择 ossutil.exe',
+                      onPressed: busy
+                          ? null
+                          : () => _pickExecutable(key, '选择 ossutil.exe'),
+                      icon: const Icon(Icons.cloud_upload_outlined),
+                    ),
+                    _ => null,
+                  },
                 ),
               );
-            }
-            final (key, label, secret) = _fields[index];
-            final numeric =
-                key == 'uploadConcurrency' ||
-                key == 'uploadRetries' ||
-                key == 'transcodeConcurrency' ||
-                key == 'copyConcurrency' ||
-                key == 'cleanupConcurrency';
-            return TextFormField(
-              controller: _controllers[key],
-              obscureText: secret,
-              keyboardType: numeric ? TextInputType.number : TextInputType.text,
-              enabled: !_manager.running,
-              validator: (value) {
-                if (key == 'outputExtension') {
-                  final extension = value?.trim() ?? '';
-                  final normalized = extension.startsWith('.')
-                      ? extension
-                      : '.$extension';
-                  if (!RegExp(r'^\.[a-zA-Z0-9]{1,10}$').hasMatch(normalized)) {
-                    return '请输入有效的扩展名，例如 .mp4';
-                  }
-                }
-                if (numeric) {
-                  final parsed = int.tryParse(value ?? '');
-                  final isRetries = key == 'uploadRetries';
-                  final min = isRetries ? 0 : 1;
-                  final max = key == 'transcodeConcurrency'
-                      ? 8
-                      : key == 'uploadRetries'
-                      ? 5
-                      : 32;
-                  if (parsed == null || parsed < min || parsed > max) {
-                    return '请输入 $min 到 $max 之间的整数';
-                  }
-                }
-                return null;
-              },
-              decoration: InputDecoration(labelText: label),
-            );
-          },
+            },
+          ),
         ),
       ),
-    ),
-  );
+    );
+  }
 
   Widget _progressPanel() {
     final stage = switch (_state.stage) {
@@ -491,9 +841,17 @@ class _PipelinePageState extends State<PipelinePage> {
       PipelineStage.idle => '就绪',
     };
     final running = _manager.running;
+    final busy = running || _starting;
     final scanning =
         _state.stage == PipelineStage.copying &&
         _state.message.startsWith('扫描中');
+    // 批量模式没有逐文件进度，但 ossutil 仍可能报告整体百分比。
+    // 只有外部工具没有给出百分比时才使用不确定进度条，避免隐藏已有进度。
+    final overallIndeterminate =
+        scanning ||
+        (_state.stage == PipelineStage.uploading &&
+            _state.message.startsWith('批量上传') &&
+            _state.fileProgress == null);
     return Card(
       elevation: 0,
       child: Padding(
@@ -506,11 +864,21 @@ class _PipelinePageState extends State<PipelinePage> {
             Row(
               children: [
                 Text(stage, style: Theme.of(context).textTheme.titleMedium),
+                if (_state.paused) ...[
+                  const SizedBox(width: 10),
+                  const Chip(
+                    avatar: Icon(Icons.pause_circle_outline, size: 18),
+                    label: Text('已暂停'),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ],
                 const Spacer(),
                 if (running && !_state.paused)
                   IconButton(
-                    tooltip: '暂停',
-                    onPressed: _manager.pause,
+                    tooltip: _manager.bulkUploadActive ? '批量上传中不可暂停' : '暂停',
+                    onPressed: _manager.bulkUploadActive
+                        ? null
+                        : _manager.pause,
                     icon: const Icon(Icons.pause_circle_outline),
                   )
                 else if (running)
@@ -526,9 +894,9 @@ class _PipelinePageState extends State<PipelinePage> {
                     icon: const Icon(Icons.stop_circle_outlined),
                   ),
                 FilledButton.icon(
-                  onPressed: running ? null : _start,
+                  onPressed: busy ? null : _start,
                   icon: const Icon(Icons.play_arrow),
-                  label: const Text('开始任务'),
+                  label: Text(_starting ? '准备中…' : '开始任务'),
                 ),
               ],
             ),
@@ -538,13 +906,13 @@ class _PipelinePageState extends State<PipelinePage> {
                 const SizedBox(width: 92, child: Text('总体进度')),
                 Expanded(
                   child: LinearProgressIndicator(
-                    value: scanning ? null : _state.overall,
+                    value: overallIndeterminate ? null : _state.overall,
                   ),
                 ),
                 const SizedBox(width: 12),
                 Text(
-                  scanning
-                      ? '扫描中'
+                  overallIndeterminate
+                      ? (scanning ? '扫描中' : 'ossutil 上传中')
                       : '${(_state.overall * 100).toStringAsFixed(1)}%',
                 ),
               ],
@@ -797,11 +1165,11 @@ class _PipelinePageState extends State<PipelinePage> {
           ),
         ),
         const Divider(height: 1),
-        if (_logSaveError != null)
+        if (_renderedLogError != null)
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
             child: Text(
-              '日志保存错误：$_logSaveError',
+              '日志诊断：$_renderedLogError',
               style: TextStyle(color: Theme.of(context).colorScheme.error),
             ),
           ),

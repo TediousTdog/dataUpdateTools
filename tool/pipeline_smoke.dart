@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:untitled/models/app_config.dart';
+import 'package:untitled/models/oss_authorization.dart';
 import 'package:untitled/services/copy_service.dart';
 import 'package:untitled/services/cleanup_service.dart';
 import 'package:untitled/services/config_repository.dart';
@@ -26,6 +28,9 @@ Future<void> main() async {
     await _verifyCopyFailureStopsScheduling(root);
     _verifyFfmpegProgressParser();
     _verifyFfmpegArgumentTemplate();
+    _verifyOssAuthorizationAndArguments();
+    await _verifyBulkUploadPipeline(root);
+    await _verifyBulkFailureRedactsAuthorization(root);
     _verifyLogSeverityClassification();
     await _verifyDistinctTranscodeOutputs(root);
     await _verifyProcessRunner();
@@ -39,17 +44,215 @@ Future<void> main() async {
     await _verifyRetryDoesNotRegressOverallProgress(root);
     await _verifyCancellationStopsDispatch(root);
     await _verifyCancellationMarksActiveTasksAborted(root);
+    await _verifyManagerCloseWaitsForRun(root);
+    await _verifyBrokenLogCallbackDoesNotBreakPipeline(root);
+    await _verifyBrokenLogCallbackDoesNotBreakControls(root);
     await _verifyUploadFailureStopsScheduling(root);
+    await _verifyPipelineFailureRedactsCredentials(root);
     await _verifyEmptyPipelineProgress(root);
     await _verifyCleanupPoolPauseAndLimit(root);
     await _verifyCleanupFailureStopsScheduling(root);
     await _verifyCleanupCancellationDrainsCurrentFiles(root);
+    await _verifyCleanupIsIdempotentForMissingFiles(root);
+    await _verifyCleanupIsIdempotentForMissingRunDirectory(root);
     await _verifyCleanupRejectsOutsideFiles(root);
     await _verifyCleanupIsScopedToCurrentRun(root);
     stdout.writeln('Pipeline smoke checks passed.');
   } finally {
     await root.delete(recursive: true);
   }
+}
+
+void _verifyOssAuthorizationAndArguments() {
+  final token = base64Encode(
+    utf8.encode(
+      jsonEncode({
+        'id': 'demo-id',
+        'secret': 'demo-secret',
+        'region': 'oss-cn-shanghai',
+        'osspath': 'oss://demo-bucket/中文 前缀/',
+        'eptpl': 'https://oss-cn-shanghai.aliyuncs.com',
+      }),
+    ),
+  );
+  final authorization = OssAuthorization.parse(' \n$token\n ');
+  _check(
+    authorization.bucket == 'demo-bucket' &&
+        authorization.prefix == '中文 前缀' &&
+        authorization.endpoint == 'https://oss-cn-shanghai.aliyuncs.com',
+    'Base64 OSS authorization was not decoded without corrupting Unicode',
+  );
+  final urlSafeToken = token
+      .replaceAll('+', '-')
+      .replaceAll('/', '_')
+      .replaceAll('=', '');
+  final urlSafeAuthorization = OssAuthorization.parse(urlSafeToken);
+  final jsonAuthorization = OssAuthorization.parse(
+    jsonEncode({
+      'accessKeyId': 'direct-id',
+      'accessKeySecret': 'direct-secret',
+      'region': 'cn-hangzhou',
+      'osspath': 'oss://another-bucket/path',
+    }),
+  );
+  _check(
+    urlSafeAuthorization.prefix == authorization.prefix &&
+        jsonAuthorization.endpoint == 'https://oss-cn-hangzhou.aliyuncs.com',
+    'URL-safe Base64 or direct JSON OSS authorization was not supported',
+  );
+  final config = AppConfig(
+    authorizationCode: token,
+    securityToken: 'stale-token-must-not-be-used',
+    multipartParallel: 11,
+    bigFileThresholdMb: 100,
+    partSizeMb: 8,
+  );
+  final service = OssService(_CapturingProcessRunner());
+  final workspace = p.join(Directory.systemTemp.path, 'Media Work');
+  final args = service.buildUploadArguments(
+    File(p.join(workspace, '中文 文件.jpg')),
+    config: config,
+    workspace: workspace,
+  );
+  _check(
+    args.contains('oss://demo-bucket/中文 前缀/中文 文件.jpg') &&
+        args.contains('--parallel=11') &&
+        args.contains('--bigfile-threshold=104857600') &&
+        args.contains('--part-size=8388608') &&
+        !args.contains('stale-token-must-not-be-used') &&
+        !args.contains('-t'),
+    'OSS argv did not preserve Unicode path or byte-sized multipart flags: $args',
+  );
+}
+
+Future<void> _verifyBulkUploadPipeline(Directory root) async {
+  final source = Directory(p.join(root.path, '批量 upload source'))..createSync();
+  await File(p.join(source.path, '中文 image.jpg')).writeAsString('pixels');
+  final authorizationCode = base64Encode(
+    utf8.encode(
+      jsonEncode({
+        'id': 'batch-id',
+        'secret': 'batch-secret',
+        'region': 'oss-cn-shanghai',
+        'osspath': 'oss://archive-bucket/相机/第一批/',
+        'eptpl': 'https://oss-cn-shanghai.aliyuncs.com',
+      }),
+    ),
+  );
+  final releaseBatch = Completer<void>();
+  final runner = _CapturingProcessRunner(holdUntil: releaseBatch.future);
+  final manager = PipelineManager(runner: runner);
+  final snapshots = <PipelineSnapshot>[];
+  final subscription = manager.events.listen(snapshots.add);
+  final logs = <String>[];
+  final run = manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: p.join(root.path, '批量 upload workspace'),
+      authorizationCode: authorizationCode,
+      securityToken: 'stale-token-must-not-be-used',
+      ossutilPath: 'ossutil-test-double',
+      videoExtensions: const ['.mov'],
+      uploadConcurrency: 10,
+      multipartParallel: 8,
+    ),
+    log: logs.add,
+  );
+  try {
+    await runner.started.future.timeout(const Duration(seconds: 5));
+    _check(
+      manager.bulkUploadActive,
+      'bulk upload active state was not exposed',
+    );
+    manager.pause();
+    _check(
+      !manager.snapshot.paused &&
+          logs.any((line) => line.contains('批量上传不支持运行中暂停')),
+      'bulk upload incorrectly reported a pause it cannot perform',
+    );
+  } finally {
+    if (!releaseBatch.isCompleted) releaseBatch.complete();
+  }
+  await run;
+  await Future<void>.delayed(Duration.zero);
+  await subscription.cancel();
+  final args = runner.lastArguments ?? const <String>[];
+  _check(
+    args.contains('-rf') &&
+        args.contains('--jobs=10') &&
+        args.contains('--parallel=8') &&
+        args.any((arg) => arg.endsWith('${Platform.pathSeparator}.')) &&
+        args.contains('oss://archive-bucket/相机/第一批/') &&
+        args.contains('batch-id') &&
+        args.contains('batch-secret') &&
+        !args.contains('stale-token-must-not-be-used'),
+    'bulk upload did not use the configured high-throughput ossutil command: $args',
+  );
+  _check(
+    snapshots.any(
+      (snapshot) =>
+          snapshot.stage == PipelineStage.uploading &&
+          snapshot.message.startsWith('批量上传中') &&
+          snapshot.fileProgress == null,
+    ),
+    'bulk upload without console percentages was not shown as indeterminate',
+  );
+  _check(
+    manager.snapshot.stage == PipelineStage.completed &&
+        manager.snapshot.overall == 1,
+    'bulk upload pipeline did not complete cleanly',
+  );
+  _check(
+    logs.any((line) => line.contains('任务配置：')) &&
+        logs.any((line) => line.contains('并行参数：')) &&
+        logs.any((line) => line.contains('任务完成：已上传')) &&
+        logs.every((line) => !line.contains('batch-secret')),
+    'pipeline audit log was incomplete or leaked the secret',
+  );
+}
+
+Future<void> _verifyBulkFailureRedactsAuthorization(Directory root) async {
+  final source = Directory(p.join(root.path, 'auth redaction source'))
+    ..createSync();
+  await File(p.join(source.path, 'photo.jpg')).writeAsString('image');
+  final authorizationCode = base64Encode(
+    utf8.encode(
+      jsonEncode({
+        'id': 'redaction-id',
+        'secret': 'redaction-secret',
+        'region': 'oss-cn-shanghai',
+        'osspath': 'oss://archive-bucket/safe/',
+        'eptpl': 'https://oss-cn-shanghai.aliyuncs.com',
+      }),
+    ),
+  );
+  final manager = PipelineManager(
+    runner: _CapturingProcessRunner(failWithSpawnError: true),
+  );
+  final logs = <String>[];
+  try {
+    await manager.run(
+      AppConfig(
+        sourcePath: source.path,
+        workspacePath: p.join(root.path, 'auth redaction workspace'),
+        authorizationCode: authorizationCode,
+        ossutilPath: 'ossutil-test-double',
+        videoExtensions: const ['.mov'],
+        uploadRetries: 0,
+      ),
+      log: logs.add,
+    );
+  } catch (_) {
+    // 故意制造携带 argv 的 ProcessException，检查流水线 UI/日志脱敏。
+  }
+  final visible = '${manager.snapshot.message}\n${logs.join('\n')}';
+  _check(
+    manager.snapshot.stage == PipelineStage.failed &&
+        !visible.contains('redaction-id') &&
+        !visible.contains('redaction-secret') &&
+        !visible.contains(authorizationCode),
+    'bulk upload failure exposed authorization credentials in UI/logs',
+  );
 }
 
 Future<void> _verifyConfigPersistence(Directory root) async {
@@ -66,6 +269,7 @@ Future<void> _verifyConfigPersistence(Directory root) async {
     accessKeySecret: 'test-secret',
     securityToken: 'test-token',
     videoExtensions: ['.mov', '.avi', '.mxf'],
+    transcodeEnabled: false,
     uploadConcurrency: 7,
     transcodeConcurrency: 3,
     copyConcurrency: 5,
@@ -79,6 +283,7 @@ Future<void> _verifyConfigPersistence(Directory root) async {
     loaded.toPrettyJson() == expected.toPrettyJson(),
     'config JSON round-trip did not preserve user settings',
   );
+  _check(!loaded.transcodeEnabled, 'transcode toggle was not persisted');
   await Future.wait([
     repository.save(expected.copyWith(prefix: 'parallel/one')),
     repository.save(expected.copyWith(prefix: 'parallel/two')),
@@ -338,6 +543,16 @@ Future<void> _verifyProcessRunner() async {
   _check(
     echoOutput.contains('ARG:path with spaces'),
     'argv spacing was not preserved',
+  );
+  final encodedOutput = <String>[];
+  final encodedExit = await runner.run(
+    executable: Platform.resolvedExecutable,
+    arguments: [fixture, 'utf8-lines'],
+    log: encodedOutput.add,
+  );
+  _check(
+    encodedExit == 0 && encodedOutput.join('|') == '中文|完成',
+    'ProcessRunner corrupted UTF-8 or split CRLF across process chunks',
   );
   var callbackFailed = false;
   try {
@@ -710,6 +925,52 @@ Future<void> _verifyCleanupRejectsOutsideFiles(Directory root) async {
   _check(
     await runDirectory.exists(),
     'rejected cleanup removed its run directory',
+  );
+}
+
+Future<void> _verifyCleanupIsIdempotentForMissingFiles(Directory root) async {
+  final run = Directory(p.join(root.path, 'cleanup-missing-run'))..createSync();
+  final missing = File(p.join(run.path, 'already-gone.jpg'));
+  var deleteCalls = 0;
+  await CleanupService(
+    deleteFile: (file) async {
+      deleteCalls++;
+      throw const FileSystemException('file disappeared during cleanup');
+    },
+  ).cleanRun(
+    rootPath: run.path,
+    files: [missing],
+    concurrency: 1,
+    gate: PauseGate(),
+    onTask: (_, _, _) {},
+    onProgress: (_, _, _) {},
+  );
+  _check(deleteCalls == 1, 'cleanup did not attempt the missing file');
+  _check(!await run.exists(), 'idempotent cleanup left an empty run directory');
+}
+
+Future<void> _verifyCleanupIsIdempotentForMissingRunDirectory(
+  Directory root,
+) async {
+  final run = Directory(p.join(root.path, 'cleanup-missing-root'))
+    ..createSync();
+  final progress = <double>[];
+  await CleanupService(
+    deleteDirectory: (directory) async {
+      await directory.delete(recursive: true);
+      throw const FileSystemException('directory moved during cleanup');
+    },
+  ).cleanRun(
+    rootPath: run.path,
+    files: const [],
+    concurrency: 1,
+    gate: PauseGate(),
+    onTask: (_, _, _) {},
+    onProgress: (value, _, _) => progress.add(value),
+  );
+  _check(
+    progress.isNotEmpty && progress.last == 1,
+    'missing run directory was not treated as successfully cleaned',
   );
 }
 
@@ -1289,6 +1550,59 @@ Future<void> _verifyUploadFailureStopsScheduling(Directory root) async {
   );
 }
 
+Future<void> _verifyPipelineFailureRedactsCredentials(Directory root) async {
+  const accessKeyId = 'sensitive-key';
+  const accessKeySecret = 'sensitive-key-secret';
+  const securityToken = 'sensitive-security-token';
+  final source = Directory(p.join(root.path, 'redaction-source'))..createSync();
+  await File(p.join(source.path, 'photo.jpg')).writeAsString('image');
+  final logs = <String>[];
+  final manager = PipelineManager(
+    oss: _CredentialFailingOss(),
+    runner: ProcessRunner(),
+  );
+  var failed = false;
+  try {
+    await manager.run(
+      const AppConfig(
+        sourcePath: '',
+        workspacePath: '',
+        bucket: 'test-bucket',
+        endpoint: 'https://example.invalid',
+        accessKeyId: accessKeyId,
+        accessKeySecret: accessKeySecret,
+        securityToken: securityToken,
+        videoExtensions: ['.mov'],
+        uploadRetries: 0,
+      ).copyWith(
+        sourcePath: source.path,
+        workspacePath: p.join(root.path, 'redaction-work'),
+      ),
+      log: logs.add,
+    );
+  } on StateError {
+    failed = true;
+  }
+  _check(failed, 'credential redaction fixture did not fail as expected');
+  final visibleContent = '${manager.snapshot.message}\n${logs.join('\n')}';
+  _check(
+    [
+      accessKeyId,
+      accessKeySecret,
+      securityToken,
+    ].every((secret) => !visibleContent.contains(secret)),
+    'pipeline failure UI/log output exposed a credential',
+  );
+  _check(
+    !visibleContent.contains('-secret'),
+    'overlapping credential redaction leaked the longer secret suffix',
+  );
+  _check(
+    visibleContent.contains('***'),
+    'redacted pipeline error did not retain a useful diagnostic marker',
+  );
+}
+
 Future<void> _verifyTranscodeFailureStopsScheduling(Directory root) async {
   final source = Directory(p.join(root.path, 'transcode-failure-source'))
     ..createSync();
@@ -1410,6 +1724,134 @@ Future<void> _verifyCancellationMarksActiveTasksAborted(Directory root) async {
   _check(
     manager.snapshot.activeTasks.any((task) => task.status == '已中止'),
     'cancelled external task was not labeled aborted',
+  );
+}
+
+Future<void> _verifyManagerCloseWaitsForRun(Directory root) async {
+  final source = Directory(p.join(root.path, 'manager-close-source'))
+    ..createSync();
+  await File(p.join(source.path, 'photo.jpg')).writeAsString('image');
+  final releaseUpload = Completer<void>();
+  final oss = _FakeOss(expectedFirstBatch: 1, holdUntil: releaseUpload.future);
+  final manager = PipelineManager(oss: oss, runner: ProcessRunner());
+  final observed = <PipelineSnapshot>[];
+  final eventsClosed = Completer<void>();
+  manager.events.listen(observed.add, onDone: eventsClosed.complete);
+  final run = manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: p.join(root.path, 'manager-close-workspace'),
+      videoExtensions: const ['.mov'],
+      uploadConcurrency: 1,
+    ),
+    log: (_) => throw StateError('simulated close logger error'),
+  );
+  await oss.firstBatchStarted.future.timeout(const Duration(seconds: 5));
+  final closeOne = manager.close();
+  final closeTwo = manager.close();
+  _check(
+    identical(closeOne, closeTwo),
+    'manager close calls were not coalesced',
+  );
+  if (!releaseUpload.isCompleted) releaseUpload.complete();
+  await closeOne.timeout(const Duration(seconds: 5));
+  await run.timeout(const Duration(seconds: 5));
+  await eventsClosed.future.timeout(const Duration(seconds: 2));
+  _check(!manager.running, 'manager remained running after close');
+  _check(
+    observed.any((snapshot) => snapshot.stage == PipelineStage.cancelled),
+    'manager closed before publishing the cancelled terminal snapshot',
+  );
+  _check(
+    manager.lastLogError.toString().contains('simulated close logger error'),
+    'manager did not retain a synchronous close logger error',
+  );
+  var rejected = false;
+  try {
+    await manager.run(
+      AppConfig(
+        sourcePath: source.path,
+        workspacePath: p.join(root.path, 'manager-close-again'),
+      ),
+      log: (_) {},
+    );
+  } on StateError {
+    rejected = true;
+  }
+  _check(rejected, 'closed manager accepted a new pipeline run');
+}
+
+Future<void> _verifyBrokenLogCallbackDoesNotBreakPipeline(
+  Directory root,
+) async {
+  const securityToken = 'logger-callback-sensitive-token';
+  final source = Directory(p.join(root.path, 'broken-log-source'))
+    ..createSync();
+  await File(p.join(source.path, 'photo.jpg')).writeAsString('image');
+  final manager = PipelineManager(oss: _FastOss(), runner: ProcessRunner());
+  await manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: p.join(root.path, 'broken-log-workspace'),
+      securityToken: securityToken,
+      videoExtensions: const ['.mov'],
+      uploadConcurrency: 1,
+    ),
+    log: (_) => throw StateError('simulated closed log sink $securityToken'),
+  );
+  _check(
+    manager.snapshot.stage == PipelineStage.completed,
+    'synchronous log callback failure aborted otherwise successful work',
+  );
+  _check(
+    manager.lastLogError.toString().contains('simulated closed log sink'),
+    'log callback failure was not exposed for diagnostics',
+  );
+  _check(
+    !manager.lastLogError!.contains(securityToken) &&
+        manager.lastLogError!.contains('***'),
+    'diagnostic UI exposed the credential embedded in a log callback error',
+  );
+}
+
+Future<void> _verifyBrokenLogCallbackDoesNotBreakControls(
+  Directory root,
+) async {
+  final source = Directory(p.join(root.path, 'broken-control-log-source'))
+    ..createSync();
+  await File(p.join(source.path, 'photo.jpg')).writeAsString('image');
+  final releaseUpload = Completer<void>();
+  final oss = _FakeOss(expectedFirstBatch: 1, holdUntil: releaseUpload.future);
+  final manager = PipelineManager(oss: oss, runner: ProcessRunner());
+  final run = manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: p.join(root.path, 'broken-control-log-workspace'),
+      videoExtensions: const ['.mov'],
+      uploadConcurrency: 1,
+    ),
+    log: (_) => throw StateError('simulated control log callback failure'),
+  );
+  try {
+    await oss.firstBatchStarted.future.timeout(const Duration(seconds: 5));
+    manager.pause();
+    _check(manager.snapshot.paused, 'pause failed when log callback threw');
+    manager.resume();
+    _check(!manager.snapshot.paused, 'resume failed when log callback threw');
+    await manager.cancel();
+  } finally {
+    if (!releaseUpload.isCompleted) releaseUpload.complete();
+  }
+  await run.timeout(const Duration(seconds: 5));
+  _check(
+    manager.snapshot.stage == PipelineStage.cancelled,
+    'cancel failed when log callback threw',
+  );
+  _check(
+    manager.lastLogError.toString().contains(
+      'simulated control log callback failure',
+    ),
+    'control log callback failure was not available for diagnosis',
   );
 }
 
@@ -1555,5 +1997,48 @@ class _FastOss extends OssService {
     required ProgressCallback progress,
   }) async {
     progress(1, 'upload complete');
+  }
+}
+
+class _CredentialFailingOss extends OssService {
+  _CredentialFailingOss() : super(ProcessRunner());
+
+  @override
+  Future<void> upload(
+    File file, {
+    required AppConfig config,
+    required String workspace,
+    required LogCallback log,
+    required ProgressCallback progress,
+  }) async {
+    throw StateError(
+      'rejected ${config.accessKeyId} ${config.accessKeySecret} ${config.securityToken}',
+    );
+  }
+}
+
+class _CapturingProcessRunner extends ProcessRunner {
+  _CapturingProcessRunner({this.holdUntil, this.failWithSpawnError = false});
+
+  final Future<void>? holdUntil;
+  final bool failWithSpawnError;
+  final started = Completer<void>();
+  List<String>? lastArguments;
+
+  @override
+  Future<int> run({
+    required String executable,
+    required List<String> arguments,
+    required LogCallback log,
+    void Function(String line)? onStdout,
+    void Function(String line)? onStderr,
+  }) async {
+    lastArguments = List<String>.from(arguments);
+    if (!started.isCompleted) started.complete();
+    await holdUntil;
+    if (failWithSpawnError) {
+      throw ProcessException(executable, arguments, 'simulated spawn error');
+    }
+    return 0;
   }
 }

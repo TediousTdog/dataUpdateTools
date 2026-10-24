@@ -45,7 +45,11 @@ class ConfigRepository {
       '${target.path}.tmp.${DateTime.now().microsecondsSinceEpoch}',
     );
     try {
-      await temporary.writeAsString(config.toPrettyJson(), flush: true);
+      await temporary.writeAsString(
+        config.toPrettyJson(),
+        encoding: utf8,
+        flush: true,
+      );
       await temporary.rename(target.path);
     } finally {
       if (await temporary.exists()) {

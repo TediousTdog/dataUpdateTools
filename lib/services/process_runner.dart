@@ -50,8 +50,10 @@ class ProcessRunner {
     final outDone = Completer<void>();
     final errDone = Completer<void>();
     process.stdout
-        .transform(const Utf8Decoder(allowMalformed: true))
-        .transform(const LineSplitter())
+        // ossutil/ffmpeg 的 Windows 版本可能分别输出 UTF-8 或当前代码页
+        // （中文系统通常是 GBK）。按“每行”自适应解码，既保留实时进度，
+        // 又不会因一种编码失败而丢失后续日志。
+        .transform(_adaptiveLineDecoder())
         .listen(
           (line) {
             consumeLine(line, onStdout);
@@ -62,8 +64,7 @@ class ProcessRunner {
           onDone: outDone.complete,
         );
     process.stderr
-        .transform(const Utf8Decoder(allowMalformed: true))
-        .transform(const LineSplitter())
+        .transform(_adaptiveLineDecoder())
         .listen(
           (line) {
             consumeLine(line, onStderr);
@@ -93,4 +94,55 @@ class ProcessRunner {
     }
     _active.clear();
   }
+}
+
+StreamTransformer<List<int>, String> _adaptiveLineDecoder() {
+  final bytes = <int>[];
+  String decode(List<int> line) {
+    try {
+      return utf8.decode(line, allowMalformed: false);
+    } on FormatException {
+      // systemEncoding 在 Windows 使用当前活动代码页；在 macOS/Linux
+      // 仍为 UTF-8。这里只在严格 UTF-8 失败时走回退路径。
+      try {
+        return systemEncoding.decode(line);
+      } on Object {
+        // 开发环境若没有可用的系统代码页，也要保留日志行而不是让
+        // stdout stream 结束并丢掉后续进度。
+        return utf8.decode(line, allowMalformed: true);
+      }
+    }
+  }
+
+  return StreamTransformer<List<int>, String>.fromHandlers(
+    handleData: (chunk, sink) {
+      bytes.addAll(chunk);
+      var start = 0;
+      for (var index = 0; index < bytes.length; index++) {
+        final delimiter = bytes[index];
+        if (delimiter != 0x0a && delimiter != 0x0d) continue;
+        // A CR at the very end of a chunk may be the first half of CRLF;
+        // leave it buffered until the next chunk arrives.
+        if (delimiter == 0x0d && index == bytes.length - 1) break;
+        var line = bytes.sublist(start, index);
+        sink.add(decode(line));
+        start = index + 1;
+        if (delimiter == 0x0d && start < bytes.length && bytes[start] == 0x0a) {
+          index++;
+          start++;
+        }
+      }
+      if (start > 0) bytes.removeRange(0, start);
+    },
+    handleDone: (sink) {
+      if (bytes.isNotEmpty) {
+        var line = List<int>.from(bytes);
+        if (line.isNotEmpty && line.last == 0x0d) {
+          line = line.sublist(0, line.length - 1);
+        }
+        sink.add(decode(line));
+      }
+      sink.close();
+    },
+  );
 }
