@@ -319,7 +319,15 @@ class PipelineManager {
       }
 
       update(PipelineStage.uploading, uploadStart, message: '枚举本次工作区文件');
-      final workspaceFiles = await _listFiles(runWorkspace, gate: gate);
+      final workspaceFiles = await _listFiles(
+        runWorkspace,
+        gate: gate,
+        onProgress: (discovered) => update(
+          PipelineStage.uploading,
+          uploadStart,
+          message: '枚举中，已发现 $discovered 个文件',
+        ),
+      );
       final count = workspaceFiles.length;
       update(
         PipelineStage.uploading,
@@ -327,7 +335,17 @@ class PipelineManager {
         total: count,
         message: '统计 $count 个文件大小',
       );
-      final uploadFileSizes = await _measureFileSizes(workspaceFiles, gate);
+      final uploadFileSizes = await _measureFileSizes(
+        workspaceFiles,
+        gate,
+        onProgress: (measured, total) => update(
+          PipelineStage.uploading,
+          uploadStart,
+          total: count,
+          done: measured,
+          message: '统计文件大小 $measured/$count（${_formatBytes(total)}）',
+        ),
+      );
       final totalUploadWorkUnits = uploadFileSizes.fold<int>(
         0,
         (sum, size) => sum + (size > 0 ? size : 1),
@@ -563,26 +581,41 @@ class PipelineManager {
   Future<List<File>> _listFiles(
     String rootPath, {
     required PauseGate gate,
+    void Function(int discovered)? onProgress,
   }) async {
     final result = <File>[];
     final root = Directory(rootPath);
     if (!await root.exists()) return result;
     await for (final entity in root.list(recursive: true, followLinks: false)) {
       await gate.checkpoint();
-      if (entity is File) result.add(entity);
+      if (entity is File) {
+        result.add(entity);
+        if (result.length % 100 == 0) onProgress?.call(result.length);
+      }
     }
     return result;
   }
 
-  Future<List<int>> _measureFileSizes(List<File> files, PauseGate gate) async {
+  Future<List<int>> _measureFileSizes(
+    List<File> files,
+    PauseGate gate, {
+    void Function(int measured, int totalBytes)? onProgress,
+  }) async {
     final sizes = List<int>.filled(files.length, 0);
     var next = 0;
+    var measured = 0;
+    var totalBytes = 0;
     Future<void> worker() async {
       while (true) {
         await gate.checkpoint();
         final index = next++;
         if (index >= files.length) return;
         sizes[index] = await files[index].length();
+        measured++;
+        totalBytes += sizes[index];
+        if (measured % 100 == 0 || measured == files.length) {
+          onProgress?.call(measured, totalBytes);
+        }
       }
     }
 

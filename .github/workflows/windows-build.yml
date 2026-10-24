@@ -4,8 +4,6 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -20,7 +18,19 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: 3.44.9
           cache: true
+
+      - name: Cache CLI tools
+        id: tools-cache
+        uses: actions/cache@v4
+        with:
+          path: tools
+          key: win-tools-ossutil-1.7.19-ffmpeg-9.0.2
+
+      - name: Download Windows CLI tools
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: |
 
       - run: flutter config --enable-windows-desktop
       - run: flutter pub get
@@ -44,6 +54,11 @@ jobs:
 
       - name: Verify bundled tools
         run: ls tools/ossutil.exe tools/ffmpeg.exe tools/ffprobe.exe
+
+      - name: Analyze and test
+        run: |
+          flutter analyze
+          flutter test
 
       - name: Package release zip
         run: |

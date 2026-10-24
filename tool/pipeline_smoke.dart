@@ -22,6 +22,7 @@ Future<void> main() async {
     await _verifyZeroLengthFileWorkUnit(root);
     await _verifyCopyPoolPauseAndLimit(root);
     _verifyFfmpegProgressParser();
+    _verifyFfmpegArgumentTemplate();
     _verifyLogSeverityClassification();
     await _verifyDistinctTranscodeOutputs(root);
     await _verifyProcessRunner();
@@ -29,6 +30,7 @@ Future<void> main() async {
     await _verifyTranscodeProgressIsByteWeighted(root);
     await _verifyUnknownUploadProgress(root);
     await _verifyUploadProgressIsByteWeighted(root);
+    await _verifyUploadPreparationProgress(root);
     await _verifyUploadRetry(root);
     await _verifyRetryDoesNotRegressOverallProgress(root);
     await _verifyCancellationStopsDispatch(root);
@@ -457,6 +459,27 @@ void _verifyFfmpegProgressParser() {
   _check(values[2] == 1, 'FFmpeg end marker did not complete progress');
 }
 
+void _verifyFfmpegArgumentTemplate() {
+  final arguments = parseArgumentTemplate(
+    r'''-metadata "title=C:\Users\Media Work\clip.mov" -metadata "note=a \"quoted\" value"''',
+  );
+  _check(
+    arguments.length == 4 &&
+        arguments[0] == '-metadata' &&
+        arguments[1] == r'title=C:\Users\Media Work\clip.mov' &&
+        arguments[2] == '-metadata' &&
+        arguments[3] == 'note=a "quoted" value',
+    'FFmpeg argv parsing corrupted Windows backslashes or quoted spaces',
+  );
+  var rejectedUnclosedQuote = false;
+  try {
+    parseArgumentTemplate(' -metadata "unclosed');
+  } on FormatException {
+    rejectedUnclosedQuote = true;
+  }
+  _check(rejectedUnclosedQuote, 'unclosed FFmpeg argument quote was accepted');
+}
+
 void _verifyLogSeverityClassification() {
   _check(
     classifyLogSeverity('[ERROR] connection refused') == LogSeverity.error,
@@ -693,6 +716,45 @@ Future<void> _verifyUploadProgressIsByteWeighted(Directory root) async {
     );
     completedWeight += weight;
   }
+}
+
+Future<void> _verifyUploadPreparationProgress(Directory root) async {
+  final source = Directory(p.join(root.path, 'upload-prepare-source'))
+    ..createSync();
+  for (var index = 0; index < 205; index++) {
+    await File(p.join(source.path, 'photo_$index.jpg')).writeAsString('x');
+  }
+  final manager = PipelineManager(oss: _FastOss(), runner: ProcessRunner());
+  final messages = <String>[];
+  final subscription = manager.events.listen((snapshot) {
+    if (snapshot.stage == PipelineStage.uploading) {
+      messages.add(snapshot.message);
+    }
+  });
+  await manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: p.join(root.path, 'upload-prepare-workspace'),
+      videoExtensions: const ['.mov'],
+      uploadConcurrency: 8,
+      uploadRetries: 0,
+    ),
+    log: (_) {},
+  );
+  await Future<void>.delayed(Duration.zero);
+  await subscription.cancel();
+
+  _check(
+    messages.contains('枚举中，已发现 100 个文件') &&
+        messages.contains('枚举中，已发现 200 个文件') &&
+        messages.contains('统计文件大小 100/205（100 B）') &&
+        messages.contains('统计文件大小 200/205（200 B）'),
+    'upload file enumeration or size preparation progress was not surfaced',
+  );
+  _check(
+    manager.snapshot.stage == PipelineStage.completed,
+    'pipeline did not complete after upload preparation',
+  );
 }
 
 Future<void> _verifyLogPersistence(Directory root) async {
@@ -1008,5 +1070,20 @@ class _FakeOss extends OssService {
     } finally {
       active--;
     }
+  }
+}
+
+class _FastOss extends OssService {
+  _FastOss() : super(ProcessRunner());
+
+  @override
+  Future<void> upload(
+    File file, {
+    required AppConfig config,
+    required String workspace,
+    required LogCallback log,
+    required ProgressCallback progress,
+  }) async {
+    progress(1, 'upload complete');
   }
 }
