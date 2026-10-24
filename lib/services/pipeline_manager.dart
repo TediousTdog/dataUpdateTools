@@ -256,6 +256,10 @@ class PipelineManager {
                 );
               },
             );
+            if (gate.cancelled) {
+              setTask(taskKey, name, videoProgress[index], '已中止');
+              return;
+            }
             totalVideoProgress +=
                 (1 - videoProgress[index]) * videoWeights[index];
             videoProgress[index] = 1;
@@ -275,7 +279,13 @@ class PipelineManager {
               message: '转码完成',
             );
           } catch (error) {
-            setTask(taskKey, name, videoProgress[index], '失败');
+            setTask(
+              taskKey,
+              name,
+              videoProgress[index],
+              gate.cancelled ? '已中止' : '失败',
+            );
+            if (gate.cancelled) return;
             if (transcodeFailure == null) {
               transcodeFailure = error;
               stopTranscoding = true;
@@ -375,11 +385,20 @@ class PipelineManager {
               final delayMs = (300 * (1 << (attempt - 1)))
                   .clamp(300, 5000)
                   .toInt();
-              await _waitForRetry(
-                gate,
-                Duration(milliseconds: delayMs),
-                () => stopScheduling,
-              );
+              try {
+                await _waitForRetry(
+                  gate,
+                  Duration(milliseconds: delayMs),
+                  () => stopScheduling,
+                );
+              } on PipelineCancelledException {
+                setTask('upload:$index', name, null, '已中止');
+                return;
+              }
+              if (gate.cancelled) {
+                setTask('upload:$index', name, null, '已中止');
+                return;
+              }
               if (stopScheduling) {
                 setTask('upload:$index', name, null, '已中止');
                 return;
@@ -428,15 +447,29 @@ class PipelineManager {
                   );
                 },
               );
+              if (gate.cancelled) {
+                setTask('upload:$index', name, uploadProgress[index], '已中止');
+                return;
+              }
               fileError = null;
               break;
             } catch (error) {
               fileError = error;
+              if (gate.cancelled) {
+                setTask('upload:$index', name, uploadProgress[index], '已中止');
+                return;
+              }
               if (attempt >= retryLimit || stopScheduling) break;
             }
           }
           if (fileError != null) {
-            setTask('upload:$index', name, uploadProgress[index], '失败');
+            setTask(
+              'upload:$index',
+              name,
+              uploadProgress[index],
+              gate.cancelled ? '已中止' : '失败',
+            );
+            if (gate.cancelled) return;
             if (uploadFailure == null) {
               uploadFailure = fileError;
               stopScheduling = true;

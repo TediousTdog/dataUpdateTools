@@ -32,6 +32,7 @@ Future<void> main() async {
     await _verifyUploadRetry(root);
     await _verifyRetryDoesNotRegressOverallProgress(root);
     await _verifyCancellationStopsDispatch(root);
+    await _verifyCancellationMarksActiveTasksAborted(root);
     await _verifyUploadFailureStopsScheduling(root);
     await _verifyEmptyPipelineProgress(root);
     await _verifyCleanupIsScopedToCurrentRun(root);
@@ -874,6 +875,49 @@ Future<void> _verifyCancellationStopsDispatch(Directory root) async {
   );
 }
 
+Future<void> _verifyCancellationMarksActiveTasksAborted(Directory root) async {
+  final source = Directory(p.join(root.path, 'cancel-task-source'))
+    ..createSync();
+  await File(p.join(source.path, 'photo.jpg')).writeAsString('image');
+  final releaseUpload = Completer<void>();
+  final manager = PipelineManager(
+    oss: _FakeOss(
+      expectedFirstBatch: 1,
+      holdUntil: releaseUpload.future,
+      failAfterHold: true,
+    ),
+    runner: ProcessRunner(),
+  );
+  final run = manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: p.join(root.path, 'cancel-task-workspace'),
+      videoExtensions: const ['.mov'],
+      uploadConcurrency: 1,
+      uploadRetries: 0,
+    ),
+    log: (_) {},
+  );
+  await Future<void>.delayed(const Duration(milliseconds: 20));
+  await manager.cancel();
+  if (!releaseUpload.isCompleted) releaseUpload.complete();
+  await run.timeout(const Duration(seconds: 5));
+  _check(
+    manager.snapshot.stage == PipelineStage.cancelled,
+    'active task cancellation did not reach cancelled stage',
+  );
+  _check(
+    manager.snapshot.activeTasks.every(
+      (task) => !task.isActive || task.status == '已中止',
+    ),
+    'cancelled pipeline retained an active task status',
+  );
+  _check(
+    manager.snapshot.activeTasks.any((task) => task.status == '已中止'),
+    'cancelled external task was not labeled aborted',
+  );
+}
+
 void _check(bool condition, String message) {
   if (!condition) throw StateError(message);
 }
@@ -918,11 +962,13 @@ class _FakeOss extends OssService {
     required this.expectedFirstBatch,
     this.failFirst = false,
     this.failFirstAfterProgress = false,
+    this.failAfterHold = false,
     this.holdUntil,
   }) : super(ProcessRunner());
   final int expectedFirstBatch;
   final bool failFirst;
   final bool failFirstAfterProgress;
+  final bool failAfterHold;
   final Future<void>? holdUntil;
   final firstBatchStarted = Completer<void>();
   var started = 0;
@@ -945,6 +991,7 @@ class _FakeOss extends OssService {
     }
     try {
       await holdUntil;
+      if (failAfterHold) throw StateError('simulated process termination');
       if (failFirst && call == 1 && !failFirstAfterProgress) {
         await Future<void>.delayed(const Duration(milliseconds: 5));
         throw StateError('simulated upload failure');

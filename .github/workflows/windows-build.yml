@@ -1,0 +1,65 @@
+name: Windows Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter config --enable-windows-desktop
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+
+      - name: Download Windows CLI tools
+        run: |
+          mkdir -p tools
+          # ossutil v1.7.19（阿里云官方）
+          curl -sSL -o ossutil.zip https://gosspublic.alicdn.com/ossutil/1.7.19/ossutil-v1.7.19-windows-amd64.zip
+          unzip -j ossutil.zip '*windows-amd64/ossutil.exe' -d tools
+          rm ossutil.zip
+          # FFmpeg 9.0.2 essentials（gyan.dev 官方 release）
+          curl -sSL --retry 3 -o ffmpeg.zip https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip
+          unzip -j ffmpeg.zip '*essentials_build/bin/ffmpeg.exe' '*essentials_build/bin/ffprobe.exe' -d tools
+          rm ffmpeg.zip
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      - name: Verify bundled tools
+        run: ls tools/ossutil.exe tools/ffmpeg.exe tools/ffprobe.exe
+
+      - name: Package release zip
+        run: |
+          cd build/windows/x64/runner/Release
+          # 把 tools/ 放到 exe 同级目录，符合应用默认的工具路径约定
+          cp -r "$GITHUB_WORKSPACE/tools" .
+          zip -r "$GITHUB_WORKSPACE/untitled-windows-x64.zip" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: untitled-windows-x64
+          path: untitled-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Attach to release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: untitled-windows-x64.zip
