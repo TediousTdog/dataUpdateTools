@@ -21,6 +21,7 @@ class AppConfig {
     this.outputExtension = '.mp4',
     this.deleteAfterUpload = false,
     this.copyConcurrency = 4,
+    this.cleanupConcurrency = 4,
     this.ossExtraArgs = '',
   });
 
@@ -29,6 +30,7 @@ class AppConfig {
   final String ffmpegPath, ossutilPath, ffmpegArgs, outputExtension;
   final List<String> videoExtensions;
   final int uploadConcurrency, copyConcurrency;
+  final int cleanupConcurrency;
   final int transcodeConcurrency;
   final int uploadRetries;
   final bool deleteAfterUpload;
@@ -55,6 +57,7 @@ class AppConfig {
     String? outputExtension,
     bool? deleteAfterUpload,
     int? copyConcurrency,
+    int? cleanupConcurrency,
     String? ossExtraArgs,
   }) => AppConfig(
     sourcePath: sourcePath ?? this.sourcePath,
@@ -75,6 +78,7 @@ class AppConfig {
     outputExtension: outputExtension ?? this.outputExtension,
     deleteAfterUpload: deleteAfterUpload ?? this.deleteAfterUpload,
     copyConcurrency: copyConcurrency ?? this.copyConcurrency,
+    cleanupConcurrency: cleanupConcurrency ?? this.cleanupConcurrency,
     ossExtraArgs: ossExtraArgs ?? this.ossExtraArgs,
   );
 
@@ -97,6 +101,7 @@ class AppConfig {
     'outputExtension': outputExtension,
     'deleteAfterUpload': deleteAfterUpload,
     'copyConcurrency': copyConcurrency,
+    'cleanupConcurrency': cleanupConcurrency,
     'ossExtraArgs': ossExtraArgs,
   };
 
@@ -121,6 +126,7 @@ class AppConfig {
     outputExtension: j['outputExtension'] ?? '.mp4',
     deleteAfterUpload: j['deleteAfterUpload'] ?? false,
     copyConcurrency: j['copyConcurrency'] ?? 4,
+    cleanupConcurrency: j['cleanupConcurrency'] ?? 4,
     ossExtraArgs: j['ossExtraArgs'] ?? '',
   );
 
