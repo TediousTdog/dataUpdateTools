@@ -19,6 +19,7 @@ Future<void> main() async {
   try {
     await _verifyConfigPersistence(root);
     await _verifyLogPersistence(root);
+    await _verifyLogLifecycleRace(root);
     await _verifyIncrementalScanning(root);
     await _verifyZeroLengthFileWorkUnit(root);
     await _verifyCopyPoolPauseAndLimit(root);
@@ -1138,6 +1139,40 @@ Future<void> _verifyLogPersistence(Directory root) async {
     (await File(nextSessionPath).readAsLines()).single == 'next session',
     'new log session inherited pending lines from the previous session',
   );
+}
+
+Future<void> _verifyLogLifecycleRace(Directory root) async {
+  final store = LogStore(
+    rootDirectory: Directory(p.join(root.path, 'logs-race')),
+  );
+  await store.startSession();
+  final expected = List.generate(512, (index) => 'queued-$index');
+  // append() 在同一事件循环中先排入写队列，然后 close() 才能安全接管
+  // sink；这模拟日志高峰与窗口关闭同时发生的场景。
+  final writes = expected.map(store.append).toList(growable: false);
+  final path = store.filePath!;
+  final close = store.close();
+  await Future.wait(writes);
+  await close;
+  _check(
+    (await File(path).readAsLines()).join('|') == expected.join('|'),
+    'closing a busy log session dropped or reordered queued lines',
+  );
+
+  final nextSession = store.startSession();
+  final rejected = store.append('must be rejected while opening');
+  var rejectedAsExpected = false;
+  try {
+    await rejected;
+  } on StateError {
+    rejectedAsExpected = true;
+  }
+  await nextSession;
+  _check(
+    rejectedAsExpected,
+    'append was accepted while a new log session was still opening',
+  );
+  await store.close();
 }
 
 Future<void> _verifyParallelPauseResume(Directory root) async {

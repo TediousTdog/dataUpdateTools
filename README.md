@@ -33,7 +33,7 @@ tool/
 
 ## 运行与打包
 
-将 Windows x64 版本的 `ffmpeg.exe` 和 `ossutil.exe` 放入项目根目录的 `tools/`。打包后，将 `tools/` 整个目录复制到 `untitled.exe` 同级目录；默认工具路径是相对于 exe 目录的 `tools\\ffmpeg.exe` 和 `tools\\ossutil.exe`。也可以在界面里填绝对路径。
+将 Windows x64 版本的 `ffmpeg.exe` 和 `ossutil.exe` 放入项目根目录的 `tools/`。开发调试时会先查找程序同级 `tools/`，未找到时回退到当前项目目录；发布后将 `tools/` 整个目录复制到 `untitled.exe` 同级目录，默认工具路径是 `tools\\ffmpeg.exe` 和 `tools\\ossutil.exe`。也可以在界面里填绝对路径。
 
 在 Windows 开发环境执行：
 
