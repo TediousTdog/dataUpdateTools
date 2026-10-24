@@ -20,7 +20,14 @@ void main() {
         pipelineManager: PipelineManager(),
       ),
     );
-    await tester.pumpAndSettle();
+    // 页面含周期性 Timer 和不定进度动画，pumpAndSettle 永远不会 settle，
+    // 这里用固定时长推进帧，等待异步 _load 完成后渲染。
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 300)),
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.pump(const Duration(milliseconds: 50));
 
     expect(find.text('媒体归档工作台'), findsOneWidget);
     expect(find.text('开始任务'), findsOneWidget);
