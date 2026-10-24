@@ -37,7 +37,7 @@ class CleanupService {
     final safeFiles = files
         .map((file) {
           final path = p.normalize(p.absolute(file.path));
-          if (!p.isWithin(root, path)) {
+          if (!_isWithin(root, path)) {
             throw ArgumentError.value(
               file.path,
               'files',
@@ -94,5 +94,11 @@ class CleanupService {
     final directory = Directory(root);
     if (await directory.exists()) await _deleteDirectory(directory);
     onProgress(1, completed, safeFiles.length);
+  }
+
+  bool _isWithin(String root, String file) {
+    final normalizedRoot = Platform.isWindows ? root.toLowerCase() : root;
+    final normalizedFile = Platform.isWindows ? file.toLowerCase() : file;
+    return p.isWithin(normalizedRoot, normalizedFile);
   }
 }

@@ -55,7 +55,8 @@ jobs:
           cd build/windows/x64/runner/Release
           # 把 tools/ 放到 exe 同级目录，符合应用默认的工具路径约定
           cp -r "$GITHUB_WORKSPACE/tools" .
-          zip -r "$GITHUB_WORKSPACE/untitled-windows-x64.zip" .
+          # Git Bash 没有 zip，用 Windows 自带的 PowerShell 压缩
+          powershell.exe -NoProfile -Command "Compress-Archive -Path 'build/windows/x64/runner/Release/*' -DestinationPath 'untitled-windows-x64.zip' -Force"
 
       - uses: actions/upload-artifact@v4
         with:

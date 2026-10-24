@@ -41,6 +41,7 @@ Future<void> main() async {
     await _verifyUploadFailureStopsScheduling(root);
     await _verifyEmptyPipelineProgress(root);
     await _verifyCleanupPoolPauseAndLimit(root);
+    await _verifyCleanupFailureStopsScheduling(root);
     await _verifyCleanupCancellationDrainsCurrentFiles(root);
     await _verifyCleanupIsScopedToCurrentRun(root);
     stdout.writeln('Pipeline smoke checks passed.');
@@ -607,6 +608,77 @@ Future<void> _verifyCleanupCancellationDrainsCurrentFiles(
         remainingRuns.single is Directory &&
         (await (remainingRuns.single as Directory).list().length) > 0,
     'cancelled cleanup did not leave remaining work in its run directory',
+  );
+}
+
+Future<void> _verifyCleanupFailureStopsScheduling(Directory root) async {
+  final source = Directory(p.join(root.path, 'cleanup-failure-source'))
+    ..createSync();
+  final workspace = p.join(root.path, 'cleanup-failure-workspace');
+  for (var index = 0; index < 8; index++) {
+    await File(p.join(source.path, 'photo_$index.jpg')).writeAsString('image');
+  }
+  final bothWorkersStarted = Completer<void>();
+  final failureRaised = Completer<void>();
+  final releaseSibling = Completer<void>();
+  var deleteCalls = 0;
+  var active = 0;
+  final cleanup = CleanupService(
+    deleteFile: (file) async {
+      final call = ++deleteCalls;
+      active++;
+      if (call == 2) bothWorkersStarted.complete();
+      try {
+        if (call == 1) {
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+          failureRaised.complete();
+          throw StateError('simulated cleanup failure');
+        }
+        await releaseSibling.future;
+        await file.delete();
+      } finally {
+        active--;
+      }
+    },
+  );
+  final manager = PipelineManager(
+    oss: _FastOss(),
+    cleanup: cleanup,
+    runner: ProcessRunner(),
+  );
+  final run = manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: workspace,
+      videoExtensions: const ['.mov'],
+      cleanupConcurrency: 2,
+      deleteAfterUpload: true,
+    ),
+    log: (_) {},
+  );
+
+  await bothWorkersStarted.future.timeout(const Duration(seconds: 5));
+  await failureRaised.future.timeout(const Duration(seconds: 5));
+  await Future<void>.delayed(Duration.zero);
+  _check(manager.running, 'cleanup returned before sibling deletion drained');
+  _check(
+    deleteCalls == 2,
+    'cleanup pool dispatched additional files after its first failure',
+  );
+  releaseSibling.complete();
+  var failed = false;
+  try {
+    await run.timeout(const Duration(seconds: 5));
+  } on StateError catch (error) {
+    failed = error.message == 'simulated cleanup failure';
+  }
+  _check(failed, 'cleanup failure was not propagated');
+  _check(active == 0, 'cleanup worker remained active after failure');
+  _check(
+    manager.snapshot.stage == PipelineStage.failed &&
+        manager.snapshot.activeTaskCount == 0 &&
+        manager.snapshot.activeTasks.any((task) => task.status == '失败'),
+    'cleanup failure did not reach a terminal UI state',
   );
 }
 
