@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import '../models/app_config.dart';
 import 'copy_service.dart';
+import 'cleanup_service.dart';
 import 'ffmpeg_service.dart';
 import 'oss_service.dart';
 import 'pipeline_types.dart';
@@ -13,16 +14,19 @@ class PipelineManager {
     CopyService? copy,
     FFmpegService? ffmpeg,
     OssService? oss,
+    CleanupService? cleanup,
     ProcessRunner? runner,
   }) : _copy = copy ?? CopyService(),
        _runner = runner ?? ProcessRunner() {
     _ffmpeg = ffmpeg ?? FFmpegService(_runner);
     _oss = oss ?? OssService(_runner);
+    _cleanup = cleanup ?? CleanupService();
   }
   final CopyService _copy;
   final ProcessRunner _runner;
   late final FFmpegService _ffmpeg;
   late final OssService _oss;
+  late final CleanupService _cleanup;
   final _events = StreamController<PipelineSnapshot>.broadcast();
   Stream<PipelineSnapshot> get events => _events.stream;
   PauseGate? _gate;
@@ -138,6 +142,8 @@ class PipelineManager {
 
     void report(String line) => log(_redact(line, config));
     try {
+      // 所有路径在一次 run 开始时固定为绝对规范路径，避免工作目录变化或
+      // 相对路径导致 run 目录、相对对象 key 和清理目标不一致。
       final source = p.normalize(p.absolute(config.sourcePath));
       final workspace = p.normalize(p.absolute(config.workspacePath));
       if (p.equals(source, workspace) ||
@@ -146,7 +152,7 @@ class PipelineManager {
         throw ArgumentError('源目录与工作区不能相同或互相嵌套');
       }
       final runId = DateTime.now().toUtc().microsecondsSinceEpoch;
-      final runWorkspace = p.join(config.workspacePath, 'run_$runId');
+      final runWorkspace = p.join(workspace, 'run_$runId');
       report('本次临时工作区：$runWorkspace');
       update(PipelineStage.copying, 0, message: '扫描中，正在读取目录');
       var copyCount = 0;
@@ -535,7 +541,36 @@ class PipelineManager {
       if (config.deleteAfterUpload) {
         await gate.checkpoint();
         update(PipelineStage.cleaning, cleanupStart, message: '清理工作区');
-        await Directory(runWorkspace).delete(recursive: true);
+        final cleanupFiles = workspaceFiles;
+        update(
+          PipelineStage.cleaning,
+          cleanupStart,
+          total: cleanupFiles.length,
+          message: '准备清理 ${cleanupFiles.length} 个文件',
+        );
+        await _cleanup.cleanRun(
+          rootPath: runWorkspace,
+          files: cleanupFiles,
+          concurrency: config.cleanupConcurrency,
+          gate: gate,
+          onTask: (file, progress, status) => setTask(
+            'cleanup:${file.path}',
+            p.relative(file.path, from: runWorkspace),
+            status == '清理中' ? null : progress,
+            status,
+          ),
+          onProgress: (progress, done, total) => update(
+            PipelineStage.cleaning,
+            cleanupStart + progress * cleanupWeight,
+            // 文件删除是原子操作，没有可信的单文件百分比；总体阶段进度
+            // 则由 CleanupService 的完成文件数实时推进。
+            file: null,
+            name: _snapshot.currentFile,
+            done: done,
+            total: total,
+            message: '已清理 $done/$total 个文件',
+          ),
+        );
         update(
           PipelineStage.cleaning,
           cleanupStart + cleanupWeight,

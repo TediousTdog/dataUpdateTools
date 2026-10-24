@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:untitled/models/app_config.dart';
 import 'package:untitled/services/copy_service.dart';
+import 'package:untitled/services/cleanup_service.dart';
 import 'package:untitled/services/config_repository.dart';
 import 'package:untitled/services/ffmpeg_service.dart';
 import 'package:untitled/services/log_store.dart';
@@ -39,6 +40,8 @@ Future<void> main() async {
     await _verifyCancellationMarksActiveTasksAborted(root);
     await _verifyUploadFailureStopsScheduling(root);
     await _verifyEmptyPipelineProgress(root);
+    await _verifyCleanupPoolPauseAndLimit(root);
+    await _verifyCleanupCancellationDrainsCurrentFiles(root);
     await _verifyCleanupIsScopedToCurrentRun(root);
     stdout.writeln('Pipeline smoke checks passed.');
   } finally {
@@ -63,6 +66,7 @@ Future<void> _verifyConfigPersistence(Directory root) async {
     uploadConcurrency: 7,
     transcodeConcurrency: 3,
     copyConcurrency: 5,
+    cleanupConcurrency: 3,
     uploadRetries: 4,
     deleteAfterUpload: true,
   );
@@ -420,6 +424,190 @@ Future<void> _verifyCleanupIsScopedToCurrentRun(Directory root) async {
   _check(
     await staleFile.readAsString() == 'preserve',
     'cleanup altered prior workspace data',
+  );
+}
+
+Future<void> _verifyCleanupPoolPauseAndLimit(Directory root) async {
+  final source = Directory(p.join(root.path, 'cleanup-pool-source'))
+    ..createSync();
+  final workspace = Directory(p.join(root.path, 'cleanup-pool-workspace'))
+    ..createSync();
+  final staleFile = File(p.join(workspace.path, 'preserve.txt'));
+  await staleFile.writeAsString('prior run');
+  for (var index = 0; index < 8; index++) {
+    await File(p.join(source.path, 'photo_$index.jpg')).writeAsString('image');
+  }
+
+  const limit = 3;
+  final initialBatchStarted = Completer<void>();
+  final initialBatchDeleted = Completer<void>();
+  final releaseInitialBatch = Completer<void>();
+  var deleteCalls = 0;
+  var active = 0;
+  var maxActive = 0;
+  final cleanup = CleanupService(
+    deleteFile: (file) async {
+      final call = ++deleteCalls;
+      active++;
+      if (active > maxActive) maxActive = active;
+      if (call == limit) initialBatchStarted.complete();
+      try {
+        if (call <= limit) await releaseInitialBatch.future;
+        await file.delete();
+      } finally {
+        active--;
+      }
+    },
+  );
+  final manager = PipelineManager(
+    oss: _FastOss(),
+    cleanup: cleanup,
+    runner: ProcessRunner(),
+  );
+  final snapshots = <PipelineSnapshot>[];
+  final batchDeleted = Completer<void>();
+  final subscription = manager.events.listen((snapshot) {
+    snapshots.add(snapshot);
+    if (snapshot.stage == PipelineStage.cleaning &&
+        snapshot.completedFiles == limit &&
+        !batchDeleted.isCompleted) {
+      batchDeleted.complete();
+    }
+  });
+  final run = manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: workspace.path,
+      videoExtensions: const ['.mov'],
+      uploadConcurrency: 2,
+      cleanupConcurrency: limit,
+      deleteAfterUpload: true,
+    ),
+    log: (_) {},
+  );
+
+  try {
+    await initialBatchStarted.future.timeout(const Duration(seconds: 5));
+    _check(
+      manager.snapshot.stage == PipelineStage.cleaning &&
+          manager.snapshot.activeTaskCount == limit,
+      'cleanup workers were not visible in the pipeline snapshot',
+    );
+    _check(
+      manager.snapshot.activeTasks.any((task) => task.status == '清理中'),
+      'active cleanup work was not represented in the task list',
+    );
+    manager.pause();
+    if (!releaseInitialBatch.isCompleted) releaseInitialBatch.complete();
+    await batchDeleted.future.timeout(const Duration(seconds: 5));
+    await Future<void>.delayed(Duration.zero);
+    _check(
+      deleteCalls == limit,
+      'cleanup pool dispatched new files while paused',
+    );
+    _check(manager.snapshot.paused, 'cleanup pause state was not visible');
+  } finally {
+    if (!releaseInitialBatch.isCompleted) releaseInitialBatch.complete();
+    manager.resume();
+  }
+
+  await run.timeout(const Duration(seconds: 5));
+  await Future<void>.delayed(Duration.zero);
+  await subscription.cancel();
+  _check(
+    manager.snapshot.stage == PipelineStage.completed &&
+        manager.snapshot.overall == 1,
+    'parallel cleanup did not complete the pipeline at 100%',
+  );
+  _check(deleteCalls == 8, 'cleanup did not delete every run file');
+  _check(maxActive == limit, 'cleanup did not respect concurrency $limit');
+  _check(await staleFile.exists(), 'cleanup deleted a prior-run file');
+  _check(
+    (await workspace.list().toList()).length == 1,
+    'cleanup did not remove exactly the current run directory',
+  );
+  final cleaningProgress = snapshots
+      .where((snapshot) => snapshot.stage == PipelineStage.cleaning)
+      .map((snapshot) => snapshot.overall)
+      .toList();
+  for (var index = 1; index < cleaningProgress.length; index++) {
+    _check(
+      cleaningProgress[index] + 0.000001 >= cleaningProgress[index - 1],
+      'cleanup stage progress moved backwards',
+    );
+  }
+}
+
+Future<void> _verifyCleanupCancellationDrainsCurrentFiles(
+  Directory root,
+) async {
+  final source = Directory(p.join(root.path, 'cleanup-cancel-source'))
+    ..createSync();
+  final workspace = Directory(p.join(root.path, 'cleanup-cancel-workspace'))
+    ..createSync();
+  for (var index = 0; index < 6; index++) {
+    await File(p.join(source.path, 'photo_$index.jpg')).writeAsString('image');
+  }
+  final releaseCurrentBatch = Completer<void>();
+  final currentBatchStarted = Completer<void>();
+  var deleteCalls = 0;
+  var active = 0;
+  final cleanup = CleanupService(
+    deleteFile: (file) async {
+      deleteCalls++;
+      active++;
+      if (active == 2) currentBatchStarted.complete();
+      try {
+        await releaseCurrentBatch.future;
+        await file.delete();
+      } finally {
+        active--;
+      }
+    },
+  );
+  final manager = PipelineManager(
+    oss: _FastOss(),
+    cleanup: cleanup,
+    runner: ProcessRunner(),
+  );
+  final run = manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: workspace.path,
+      videoExtensions: const ['.mov'],
+      cleanupConcurrency: 2,
+      deleteAfterUpload: true,
+    ),
+    log: (_) {},
+  );
+
+  try {
+    await currentBatchStarted.future.timeout(const Duration(seconds: 5));
+    final cancel = manager.cancel();
+    await cancel.timeout(const Duration(seconds: 5));
+  } finally {
+    if (!releaseCurrentBatch.isCompleted) releaseCurrentBatch.complete();
+  }
+  await run.timeout(const Duration(seconds: 5));
+  _check(
+    manager.snapshot.stage == PipelineStage.cancelled,
+    'cancel during cleanup did not reach the cancelled stage',
+  );
+  _check(
+    deleteCalls == 2 && active == 0,
+    'cleanup cancellation scheduled new work or returned before active files drained',
+  );
+  _check(
+    manager.snapshot.activeTaskCount == 0 &&
+        manager.snapshot.activeTasks.every((task) => !task.isActive),
+    'cancelled cleanup retained an active task in the UI snapshot',
+  );
+  final remainingRuns = await workspace.list().toList();
+  _check(
+    remainingRuns.length == 1 &&
+        remainingRuns.single is Directory &&
+        (await (remainingRuns.single as Directory).list().length) > 0,
+    'cancelled cleanup did not leave remaining work in its run directory',
   );
 }
 
@@ -1053,14 +1241,12 @@ Future<void> _verifyCancellationMarksActiveTasksAborted(Directory root) async {
     ..createSync();
   await File(p.join(source.path, 'photo.jpg')).writeAsString('image');
   final releaseUpload = Completer<void>();
-  final manager = PipelineManager(
-    oss: _FakeOss(
-      expectedFirstBatch: 1,
-      holdUntil: releaseUpload.future,
-      failAfterHold: true,
-    ),
-    runner: ProcessRunner(),
+  final oss = _FakeOss(
+    expectedFirstBatch: 1,
+    holdUntil: releaseUpload.future,
+    failAfterHold: true,
   );
+  final manager = PipelineManager(oss: oss, runner: ProcessRunner());
   final run = manager.run(
     AppConfig(
       sourcePath: source.path,
@@ -1071,7 +1257,7 @@ Future<void> _verifyCancellationMarksActiveTasksAborted(Directory root) async {
     ),
     log: (_) {},
   );
-  await Future<void>.delayed(const Duration(milliseconds: 20));
+  await oss.firstBatchStarted.future.timeout(const Duration(seconds: 5));
   await manager.cancel();
   if (!releaseUpload.isCompleted) releaseUpload.complete();
   await run.timeout(const Duration(seconds: 5));

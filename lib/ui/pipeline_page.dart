@@ -69,6 +69,7 @@ class _PipelinePageState extends State<PipelinePage> {
     ('uploadRetries', '上传失败重试次数', false),
     ('transcodeConcurrency', '转码并发数', false),
     ('copyConcurrency', '复制并发数', false),
+    ('cleanupConcurrency', '清理并发数', false),
     ('ossExtraArgs', '额外 ossutil 参数（空格分隔）', false),
   ];
 
@@ -138,6 +139,7 @@ class _PipelinePageState extends State<PipelinePage> {
     'uploadRetries' => '${c.uploadRetries}',
     'transcodeConcurrency' => '${c.transcodeConcurrency}',
     'copyConcurrency' => '${c.copyConcurrency}',
+    'cleanupConcurrency' => '${c.cleanupConcurrency}',
     'ossExtraArgs' => c.ossExtraArgs,
     _ => '',
   };
@@ -165,6 +167,7 @@ class _PipelinePageState extends State<PipelinePage> {
     uploadRetries: int.tryParse(_text('uploadRetries')) ?? 0,
     transcodeConcurrency: int.tryParse(_text('transcodeConcurrency')) ?? 1,
     copyConcurrency: int.tryParse(_text('copyConcurrency')) ?? 1,
+    cleanupConcurrency: int.tryParse(_text('cleanupConcurrency')) ?? 1,
     ossExtraArgs: _text('ossExtraArgs'),
   );
   String _text(String key) => _controllers[key]?.text.trim() ?? '';
@@ -423,7 +426,8 @@ class _PipelinePageState extends State<PipelinePage> {
                 key == 'uploadConcurrency' ||
                 key == 'uploadRetries' ||
                 key == 'transcodeConcurrency' ||
-                key == 'copyConcurrency';
+                key == 'copyConcurrency' ||
+                key == 'cleanupConcurrency';
             return TextFormField(
               controller: _controllers[key],
               obscureText: secret,

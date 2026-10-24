@@ -63,7 +63,7 @@ class PipelineFileTask {
   final String status;
 
   bool get isActive =>
-      const {'复制中', '转码中', '上传中', '重试上传中'}.contains(status) ||
+      const {'复制中', '转码中', '上传中', '重试上传中', '清理中'}.contains(status) ||
       status.startsWith('重试 ');
 }
 
