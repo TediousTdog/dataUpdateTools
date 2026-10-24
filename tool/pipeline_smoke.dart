@@ -21,12 +21,14 @@ Future<void> main() async {
     await _verifyIncrementalScanning(root);
     await _verifyZeroLengthFileWorkUnit(root);
     await _verifyCopyPoolPauseAndLimit(root);
+    await _verifyCopyFailureStopsScheduling(root);
     _verifyFfmpegProgressParser();
     _verifyFfmpegArgumentTemplate();
     _verifyLogSeverityClassification();
     await _verifyDistinctTranscodeOutputs(root);
     await _verifyProcessRunner();
     await _verifyParallelPauseResume(root);
+    await _verifyTranscodeFailureStopsScheduling(root);
     await _verifyTranscodeProgressIsByteWeighted(root);
     await _verifyUnknownUploadProgress(root);
     await _verifyUploadProgressIsByteWeighted(root);
@@ -224,6 +226,69 @@ Future<void> _verifyCopyPoolPauseAndLimit(Directory root) async {
   _check(copied.length == 12, 'copy pool did not finish all files');
   _check(maxActiveCopies == 3, 'copy pool did not respect concurrency 3');
   _check(copyCalls == 12, 'copy pool dispatched an unexpected file count');
+}
+
+Future<void> _verifyCopyFailureStopsScheduling(Directory root) async {
+  final source = Directory(p.join(root.path, 'copy-failure-source'))
+    ..createSync();
+  for (var index = 0; index < 8; index++) {
+    await File(p.join(source.path, 'file_$index.bin')).writeAsString('payload');
+  }
+  final releaseSibling = Completer<void>();
+  final bothWorkersStarted = Completer<void>();
+  final failureRaised = Completer<void>();
+  var calls = 0;
+  var active = 0;
+  var maxActive = 0;
+  final service = CopyService(
+    copyFile: (sourceFile, targetPath) async {
+      final call = ++calls;
+      active++;
+      if (active > maxActive) maxActive = active;
+      if (call == 2) bothWorkersStarted.complete();
+      try {
+        if (call == 1) {
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+          failureRaised.complete();
+          throw StateError('simulated copy failure');
+        }
+        if (call == 2) await releaseSibling.future;
+        return await sourceFile.copy(targetPath);
+      } finally {
+        active--;
+      }
+    },
+  );
+  var finished = false;
+  final run = service
+      .copyTree(
+        source: source.path,
+        workspace: p.join(root.path, 'copy-failure-workspace'),
+        concurrency: 2,
+        gate: PauseGate(),
+        log: (_) {},
+        progress: (_, _, _, _) {},
+        onTask: (_, _, _) {},
+        onFileScanned: (_, _) {},
+        onScan: (_, _, _) {},
+      )
+      .whenComplete(() => finished = true);
+
+  await bothWorkersStarted.future.timeout(const Duration(seconds: 5));
+  await failureRaised.future.timeout(const Duration(seconds: 5));
+  await Future<void>.delayed(Duration.zero);
+  _check(!finished, 'copy stage returned before sibling worker drained');
+  _check(calls == 2, 'copy pool dispatched more work after a copy failure');
+  _check(maxActive == 2, 'copy failure test did not exercise two workers');
+  releaseSibling.complete();
+  var failed = false;
+  try {
+    await run.timeout(const Duration(seconds: 5));
+  } on StateError catch (error) {
+    failed = error.message == 'simulated copy failure';
+  }
+  _check(failed, 'copy failure was not propagated after workers drained');
+  _check(active == 0, 'copy worker remained active after failure completion');
 }
 
 Future<void> _verifyZeroLengthFileWorkUnit(Directory root) async {
@@ -900,6 +965,52 @@ Future<void> _verifyUploadFailureStopsScheduling(Directory root) async {
   );
 }
 
+Future<void> _verifyTranscodeFailureStopsScheduling(Directory root) async {
+  final source = Directory(p.join(root.path, 'transcode-failure-source'))
+    ..createSync();
+  for (var index = 0; index < 8; index++) {
+    await File(p.join(source.path, 'video_$index.mov')).writeAsString('video');
+  }
+  final ffmpeg = _FailingFfmpeg();
+  final manager = PipelineManager(ffmpeg: ffmpeg, runner: ProcessRunner());
+  final run = manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: p.join(root.path, 'transcode-failure-workspace'),
+      videoExtensions: const ['.mov'],
+      transcodeConcurrency: 2,
+      uploadConcurrency: 1,
+      uploadRetries: 0,
+    ),
+    log: (_) {},
+  );
+
+  await ffmpeg.bothWorkersStarted.future.timeout(const Duration(seconds: 5));
+  await ffmpeg.failureRaised.future.timeout(const Duration(seconds: 5));
+  await Future<void>.delayed(Duration.zero);
+  _check(ffmpeg.started == 2, 'transcode pool dispatched work after failure');
+  _check(manager.running, 'pipeline stopped before sibling transcode drained');
+  ffmpeg.releaseSibling.complete();
+  var failed = false;
+  try {
+    await run.timeout(const Duration(seconds: 5));
+  } on StateError catch (error) {
+    failed = error.message == 'simulated transcode failure';
+  }
+  _check(failed, 'transcode failure was not propagated');
+  _check(ffmpeg.active == 0, 'transcode worker remained active after failure');
+  _check(
+    manager.snapshot.stage == PipelineStage.failed &&
+        manager.snapshot.activeTaskCount == 0,
+    'transcode failure did not reach a terminal UI state',
+  );
+  _check(
+    manager.snapshot.activeTasks.any((task) => task.status == '失败') &&
+        manager.snapshot.activeTasks.any((task) => task.status == '已中止'),
+    'transcode failure and sibling abort were not both shown in task list',
+  );
+}
+
 Future<void> _verifyCancellationStopsDispatch(Directory root) async {
   final source = Directory(p.join(root.path, 'cancel-source'))..createSync();
   final workspace = p.join(root.path, 'cancel-workspace');
@@ -1012,6 +1123,43 @@ class _FakeFfmpeg extends FFmpegService {
       await output.writeAsString('converted');
       await input.delete();
       progress(1, 'transcode complete');
+      return output;
+    } finally {
+      active--;
+    }
+  }
+}
+
+class _FailingFfmpeg extends FFmpegService {
+  _FailingFfmpeg() : super(ProcessRunner());
+  final bothWorkersStarted = Completer<void>();
+  final failureRaised = Completer<void>();
+  final releaseSibling = Completer<void>();
+  var started = 0;
+  var active = 0;
+
+  @override
+  Future<File> transcode(
+    File input, {
+    required String executable,
+    required String argumentTemplate,
+    required String outputExtension,
+    required LogCallback log,
+    required ProgressCallback progress,
+  }) async {
+    final call = ++started;
+    active++;
+    if (call == 2) bothWorkersStarted.complete();
+    try {
+      if (call == 1) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+        failureRaised.complete();
+        throw StateError('simulated transcode failure');
+      }
+      await releaseSibling.future;
+      final output = File(p.setExtension(input.path, '.mp4'));
+      await output.writeAsString('converted');
+      await input.delete();
       return output;
     } finally {
       active--;
