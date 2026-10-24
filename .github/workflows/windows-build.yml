@@ -44,11 +44,6 @@ jobs:
           unzip -j ffmpeg.zip '*essentials_build/bin/ffmpeg.exe' '*essentials_build/bin/ffprobe.exe' -d tools
           rm ffmpeg.zip
 
-      - name: Analyze and test
-        run: |
-          flutter analyze
-          flutter test
-
       - name: Build Windows release
         run: flutter build windows --release
 

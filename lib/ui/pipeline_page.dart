@@ -36,6 +36,7 @@ class _PipelinePageState extends State<PipelinePage> {
   final _pendingLogs = <String>[];
   final _logSearchController = TextEditingController();
   late final ScrollController _logScrollController;
+  late final Future<void> _loadFuture;
   Timer? _logUiTimer;
   Timer? _pipelineUiTimer;
   PipelineSnapshot? _pendingPipelineState;
@@ -50,6 +51,7 @@ class _PipelinePageState extends State<PipelinePage> {
   String? _actionError;
   String _logSearchQuery = '';
   _LogFilter _logFilter = _LogFilter.all;
+  bool _disposed = false;
 
   static const _fields = <(String, String, bool)>[
     ('sourcePath', '读卡器源目录', false),
@@ -98,7 +100,7 @@ class _PipelinePageState extends State<PipelinePage> {
     _subscription = _manager.events.listen((event) {
       _pendingPipelineState = event;
     });
-    _load();
+    _loadFuture = _load();
   }
 
   Future<void> _load() async {
@@ -115,6 +117,9 @@ class _PipelinePageState extends State<PipelinePage> {
       _actionError = '读取配置失败：$error';
       _append(_actionError!);
     }
+    // 窗口可能在异步读取配置期间被关闭；不要在 dispose 后创建控制器或
+    // 调用 setState，避免泄漏控制器及 “setState after dispose” 异常。
+    if (!mounted || _disposed) return;
     for (final (key, _, _) in _fields) {
       _controllers[key] = TextEditingController(text: _value(_config, key));
     }
@@ -265,7 +270,7 @@ class _PipelinePageState extends State<PipelinePage> {
   void _append(String line) {
     final stamp = DateTime.now().toIso8601String().substring(11, 19);
     final entry = '[$stamp] $line';
-    if (mounted) _pendingLogs.add(entry);
+    if (mounted && !_disposed) _pendingLogs.add(entry);
     unawaited(
       _logStore.append(entry).catchError((Object error) {
         if (mounted) setState(() => _logSaveError = error.toString());
@@ -322,6 +327,7 @@ class _PipelinePageState extends State<PipelinePage> {
 
   @override
   void dispose() {
+    _disposed = true;
     _subscription.cancel();
     for (final c in _controllers.values) {
       c.dispose();
@@ -335,6 +341,13 @@ class _PipelinePageState extends State<PipelinePage> {
   }
 
   Future<void> _shutdown() async {
+    // 等待初次配置/日志会话初始化完成，避免 close() 与 startSession()
+    // 并发操作同一个 LogStore。
+    try {
+      await _loadFuture;
+    } catch (_) {
+      // 初始化错误已经通过 UI/日志路径尽力记录；关闭流程仍需继续。
+    }
     await _manager.cancel();
     final activeRun = _activeRun;
     if (activeRun != null) {

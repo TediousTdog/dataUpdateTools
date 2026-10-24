@@ -146,9 +146,7 @@ class PipelineManager {
       // 相对路径导致 run 目录、相对对象 key 和清理目标不一致。
       final source = p.normalize(p.absolute(config.sourcePath));
       final workspace = p.normalize(p.absolute(config.workspacePath));
-      if (p.equals(source, workspace) ||
-          p.isWithin(source, workspace) ||
-          p.isWithin(workspace, source)) {
+      if (_sameOrNestedPath(source, workspace)) {
         throw ArgumentError('源目录与工作区不能相同或互相嵌套');
       }
       final runId = DateTime.now().toUtc().microsecondsSinceEpoch;
@@ -158,7 +156,7 @@ class PipelineManager {
       var copyCount = 0;
       final sourceFileSizes = <String, int>{};
       final files = await _copy.copyTree(
-        source: config.sourcePath,
+        source: source,
         workspace: runWorkspace,
         concurrency: config.copyConcurrency,
         gate: gate,
@@ -686,6 +684,14 @@ class PipelineManager {
   String _resolveTool(String path) => p.isAbsolute(path)
       ? path
       : p.join(p.dirname(Platform.resolvedExecutable), path);
+
+  bool _sameOrNestedPath(String first, String second) {
+    // Windows 驱动器路径不区分大小写；path 包本身按字符串比较，若只用
+    // p.equals/isWithin，`D:\Media` 与 `d:\media\run` 可能被误判为安全。
+    final left = Platform.isWindows ? first.toLowerCase() : first;
+    final right = Platform.isWindows ? second.toLowerCase() : second;
+    return left == right || p.isWithin(left, right) || p.isWithin(right, left);
+  }
 
   String _formatBytes(int bytes) {
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
