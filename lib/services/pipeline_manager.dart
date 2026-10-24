@@ -681,9 +681,16 @@ class PipelineManager {
     await gate.checkpoint();
   }
 
-  String _resolveTool(String path) => p.isAbsolute(path)
-      ? path
-      : p.join(p.dirname(Platform.resolvedExecutable), path);
+  String _resolveTool(String path) {
+    if (p.isAbsolute(path)) return p.normalize(path);
+    // 发布包优先从 exe 同级目录查找；开发模式下再回退到当前工作目录，
+    // 这样把 tools/ 放在项目根目录即可直接 `flutter run -d windows` 调试。
+    final besideExecutable = p.normalize(
+      p.join(p.dirname(Platform.resolvedExecutable), path),
+    );
+    if (File(besideExecutable).existsSync()) return besideExecutable;
+    return p.normalize(p.absolute(path));
+  }
 
   bool _sameOrNestedPath(String first, String second) {
     // Windows 驱动器路径不区分大小写；path 包本身按字符串比较，若只用
