@@ -21,6 +21,9 @@ jobs:
           flutter-version: 3.44.9
           cache: true
 
+      - run: flutter config --enable-windows-desktop
+      - run: flutter pub get
+
       - name: Cache CLI tools
         id: tools-cache
         uses: actions/cache@v4
@@ -30,14 +33,6 @@ jobs:
 
       - name: Download Windows CLI tools
         if: steps.tools-cache.outputs.cache-hit != 'true'
-        run: |
-
-      - run: flutter config --enable-windows-desktop
-      - run: flutter pub get
-      - run: flutter analyze
-      - run: flutter test
-
-      - name: Download Windows CLI tools
         run: |
           mkdir -p tools
           # ossutil v1.7.19（阿里云官方）
@@ -49,16 +44,16 @@ jobs:
           unzip -j ffmpeg.zip '*essentials_build/bin/ffmpeg.exe' '*essentials_build/bin/ffprobe.exe' -d tools
           rm ffmpeg.zip
 
+      - name: Analyze and test
+        run: |
+          flutter analyze
+          flutter test
+
       - name: Build Windows release
         run: flutter build windows --release
 
       - name: Verify bundled tools
         run: ls tools/ossutil.exe tools/ffmpeg.exe tools/ffprobe.exe
-
-      - name: Analyze and test
-        run: |
-          flutter analyze
-          flutter test
 
       - name: Package release zip
         run: |
