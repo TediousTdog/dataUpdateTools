@@ -440,7 +440,6 @@ Future<void> _verifyCleanupPoolPauseAndLimit(Directory root) async {
 
   const limit = 3;
   final initialBatchStarted = Completer<void>();
-  final initialBatchDeleted = Completer<void>();
   final releaseInitialBatch = Completer<void>();
   var deleteCalls = 0;
   var active = 0;

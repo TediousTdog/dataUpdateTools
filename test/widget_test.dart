@@ -40,7 +40,9 @@ void main() {
     await tester.runAsync(
       () => Future<void>.delayed(const Duration(milliseconds: 100)),
     );
-    await temp.delete(recursive: true);
+    // 真实文件 I/O 的完成事件不会进入 FakeAsync 事件循环，
+    // 必须在 runAsync 内 await，否则测试永久挂起。
+    await tester.runAsync(() => temp.delete(recursive: true));
   });
 
   test('LogStore persists ordered lines in the session file', () async {
