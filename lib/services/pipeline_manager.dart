@@ -225,7 +225,7 @@ class PipelineManager {
           final video = videos[index];
           final name = p.relative(video.path, from: runWorkspace);
           final taskKey = 'transcode:${video.path}';
-          setTask(taskKey, name, 0, '转码中');
+          setTask(taskKey, name, null, '转码中');
           report('开始转码：$name');
           try {
             await _ffmpeg.transcode(
@@ -260,6 +260,10 @@ class PipelineManager {
               setTask(taskKey, name, videoProgress[index], '已中止');
               return;
             }
+            if (stopTranscoding && transcodeFailure != null) {
+              setTask(taskKey, name, videoProgress[index], '已中止');
+              return;
+            }
             totalVideoProgress +=
                 (1 - videoProgress[index]) * videoWeights[index];
             videoProgress[index] = 1;
@@ -283,7 +287,7 @@ class PipelineManager {
               taskKey,
               name,
               videoProgress[index],
-              gate.cancelled ? '已中止' : '失败',
+              gate.cancelled || transcodeFailure != null ? '已中止' : '失败',
             );
             if (gate.cancelled) return;
             if (transcodeFailure == null) {
@@ -447,7 +451,11 @@ class PipelineManager {
                   );
                 },
               );
-              if (gate.cancelled) {
+              if (gate.cancelled || uploadFailure != null) {
+                setTask('upload:$index', name, uploadProgress[index], '已中止');
+                return;
+              }
+              if (stopScheduling && uploadFailure != null) {
                 setTask('upload:$index', name, uploadProgress[index], '已中止');
                 return;
               }
@@ -467,7 +475,7 @@ class PipelineManager {
               'upload:$index',
               name,
               uploadProgress[index],
-              gate.cancelled ? '已中止' : '失败',
+              gate.cancelled || uploadFailure != null ? '已中止' : '失败',
             );
             if (gate.cancelled) return;
             if (uploadFailure == null) {
