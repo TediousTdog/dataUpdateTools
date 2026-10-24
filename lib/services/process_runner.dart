@@ -27,24 +27,63 @@ class ProcessRunner {
     _active.add(process);
     // 取消可能发生在 CreateProcess 尚未返回的窗口期；generation 检查防止进程漏杀。
     if (generation != _cancelGeneration) process.kill();
-    final outDone = process.stdout
+    Object? outputFailure;
+    StackTrace? outputFailureStack;
+    void recordFailure(Object error, StackTrace stack) {
+      outputFailure ??= error;
+      outputFailureStack ??= stack;
+    }
+
+    void consumeLine(String line, void Function(String)? callback) {
+      try {
+        callback?.call(line);
+      } catch (error, stack) {
+        recordFailure(error, stack);
+      }
+      try {
+        log(line);
+      } catch (error, stack) {
+        recordFailure(error, stack);
+      }
+    }
+
+    final outDone = Completer<void>();
+    final errDone = Completer<void>();
+    process.stdout
         .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
-        .listen((line) {
-          onStdout?.call(line);
-          log(line);
-        });
-    final errDone = process.stderr
+        .listen(
+          (line) {
+            consumeLine(line, onStdout);
+          },
+          onError: (Object error, StackTrace stack) {
+            recordFailure(error, stack);
+          },
+          onDone: outDone.complete,
+        );
+    process.stderr
         .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
-        .listen((line) {
-          onStderr?.call(line);
-          log(line);
-        });
-    final code = await process.exitCode;
-    await Future.wait([outDone.asFuture<void>(), errDone.asFuture<void>()]);
-    _active.remove(process);
-    return code;
+        .listen(
+          (line) {
+            consumeLine(line, onStderr);
+          },
+          onError: (Object error, StackTrace stack) {
+            recordFailure(error, stack);
+          },
+          onDone: errDone.complete,
+        );
+    try {
+      final code = await process.exitCode;
+      await Future.wait([outDone.future, errDone.future]);
+      final failure = outputFailure;
+      if (failure != null) {
+        Error.throwWithStackTrace(failure, outputFailureStack!);
+      }
+      return code;
+    } finally {
+      _active.remove(process);
+    }
   }
 
   Future<void> terminate() async {

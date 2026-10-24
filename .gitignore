@@ -43,3 +43,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Bundled Windows CLI tools (large binaries, downloaded separately)
+/tools/

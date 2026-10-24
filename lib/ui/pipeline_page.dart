@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import '../models/app_config.dart';
 import '../services/config_repository.dart';
 import '../services/log_store.dart';
+import '../services/log_severity.dart';
 import '../services/pipeline_manager.dart';
 import '../services/pipeline_types.dart';
 
@@ -176,20 +177,12 @@ class _PipelinePageState extends State<PipelinePage> {
             return false;
           }
           if (_logFilter == _LogFilter.all) return true;
-          final lower = line.toLowerCase();
-          final isError =
-              line.contains('失败') ||
-              lower.contains(' error') ||
-              lower.contains('fatal');
-          final isWarning =
-              line.contains('重试') ||
-              line.contains('已中止') ||
-              lower.contains('warning');
+          final severity = classifyLogSeverity(line);
           return switch (_logFilter) {
             _LogFilter.all => true,
-            _LogFilter.info => !isError && !isWarning,
-            _LogFilter.warning => isWarning && !isError,
-            _LogFilter.error => isError,
+            _LogFilter.info => severity == LogSeverity.info,
+            _LogFilter.warning => severity == LogSeverity.warning,
+            _LogFilter.error => severity == LogSeverity.error,
           };
         })
         .toList(growable: false);

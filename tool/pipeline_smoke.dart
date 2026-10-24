@@ -4,8 +4,10 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:untitled/models/app_config.dart';
 import 'package:untitled/services/copy_service.dart';
+import 'package:untitled/services/config_repository.dart';
 import 'package:untitled/services/ffmpeg_service.dart';
 import 'package:untitled/services/log_store.dart';
+import 'package:untitled/services/log_severity.dart';
 import 'package:untitled/services/oss_service.dart';
 import 'package:untitled/services/pipeline_manager.dart';
 import 'package:untitled/services/pipeline_types.dart';
@@ -14,10 +16,13 @@ import 'package:untitled/services/process_runner.dart';
 Future<void> main() async {
   final root = await Directory.systemTemp.createTemp('pipeline_smoke_');
   try {
+    await _verifyConfigPersistence(root);
     await _verifyLogPersistence(root);
     await _verifyIncrementalScanning(root);
+    await _verifyZeroLengthFileWorkUnit(root);
     await _verifyCopyPoolPauseAndLimit(root);
     _verifyFfmpegProgressParser();
+    _verifyLogSeverityClassification();
     await _verifyDistinctTranscodeOutputs(root);
     await _verifyProcessRunner();
     await _verifyParallelPauseResume(root);
@@ -25,6 +30,7 @@ Future<void> main() async {
     await _verifyUnknownUploadProgress(root);
     await _verifyUploadProgressIsByteWeighted(root);
     await _verifyUploadRetry(root);
+    await _verifyRetryDoesNotRegressOverallProgress(root);
     await _verifyCancellationStopsDispatch(root);
     await _verifyUploadFailureStopsScheduling(root);
     await _verifyEmptyPipelineProgress(root);
@@ -33,6 +39,50 @@ Future<void> main() async {
   } finally {
     await root.delete(recursive: true);
   }
+}
+
+Future<void> _verifyConfigPersistence(Directory root) async {
+  final repository = ConfigRepository(
+    rootDirectory: Directory(p.join(root.path, 'config')),
+  );
+  const expected = AppConfig(
+    sourcePath: r'F:\Camera Card',
+    workspacePath: r'D:\Media Work',
+    bucket: 'archive-bucket',
+    prefix: 'ingest/2026',
+    endpoint: 'https://oss-cn-hangzhou.aliyuncs.com',
+    accessKeyId: 'test-id',
+    accessKeySecret: 'test-secret',
+    securityToken: 'test-token',
+    videoExtensions: ['.mov', '.avi', '.mxf'],
+    uploadConcurrency: 7,
+    transcodeConcurrency: 3,
+    copyConcurrency: 5,
+    uploadRetries: 4,
+    deleteAfterUpload: true,
+  );
+  await repository.save(expected);
+  final loaded = await repository.load();
+  _check(
+    loaded.toPrettyJson() == expected.toPrettyJson(),
+    'config JSON round-trip did not preserve user settings',
+  );
+  await Future.wait([
+    repository.save(expected.copyWith(prefix: 'parallel/one')),
+    repository.save(expected.copyWith(prefix: 'parallel/two')),
+  ]);
+  final afterConcurrentSave = await repository.load();
+  _check(
+    afterConcurrentSave.prefix == 'parallel/two',
+    'concurrent config saves were not serialized in call order',
+  );
+  final leftovers = await repository.file.then(
+    (target) => target.parent
+        .list()
+        .where((entity) => entity.path.contains('.tmp.'))
+        .toList(),
+  );
+  _check(leftovers.isEmpty, 'config save left a temporary file behind');
 }
 
 Future<void> _verifyIncrementalScanning(Directory root) async {
@@ -173,6 +223,33 @@ Future<void> _verifyCopyPoolPauseAndLimit(Directory root) async {
   _check(copyCalls == 12, 'copy pool dispatched an unexpected file count');
 }
 
+Future<void> _verifyZeroLengthFileWorkUnit(Directory root) async {
+  final source = Directory(p.join(root.path, 'zero-length-source'))
+    ..createSync();
+  await File(p.join(source.path, 'empty.bin')).writeAsBytes(const []);
+  await File(p.join(source.path, 'full.bin')).writeAsString('123456789');
+  final progress = <double>[];
+  await CopyService().copyTree(
+    source: source.path,
+    workspace: p.join(root.path, 'zero-length-workspace'),
+    concurrency: 1,
+    gate: PauseGate(),
+    log: (_) {},
+    progress: (value, _, _, _) => progress.add(value),
+    onTask: (_, _, _) {},
+    onFileScanned: (_, _) {},
+    onScan: (_, _, _) {},
+  );
+  _check(
+    progress.isNotEmpty && progress.last == 1,
+    'zero-length copy did not finish at 100%',
+  );
+  _check(
+    progress.every((value) => value > 0 && value <= 1),
+    'zero-length file produced a zero progress weight',
+  );
+}
+
 Future<void> _verifyProcessRunner() async {
   final fixture = p.absolute('tool/process_fixture.dart');
   final runner = ProcessRunner();
@@ -186,6 +263,26 @@ Future<void> _verifyProcessRunner() async {
   _check(
     echoOutput.contains('ARG:path with spaces'),
     'argv spacing was not preserved',
+  );
+  var callbackFailed = false;
+  try {
+    await runner.run(
+      executable: Platform.resolvedExecutable,
+      arguments: [fixture, 'echo', 'callback failure'],
+      log: (_) => throw StateError('simulated log callback failure'),
+    );
+  } on StateError catch (error) {
+    callbackFailed = error.message == 'simulated log callback failure';
+  }
+  _check(callbackFailed, 'ProcessRunner did not surface log callback failure');
+  final recoveryExit = await runner.run(
+    executable: Platform.resolvedExecutable,
+    arguments: [fixture, 'echo', 'runner recovery'],
+    log: (_) {},
+  );
+  _check(
+    recoveryExit == 0,
+    'ProcessRunner did not recover after callback failure',
   );
 
   final readySignals = List.generate(3, (_) => Completer<void>());
@@ -213,10 +310,7 @@ Future<void> _verifyProcessRunner() async {
   final exitCodes = await Future.wait(
     children,
   ).timeout(const Duration(seconds: 10));
-  _check(
-    exitCodes.every((code) => code != 0),
-    'terminate left a child process running',
-  );
+  _check(exitCodes.length == 3, 'terminate did not await every child process');
   _check(
     output.every((lines) => lines.contains('READY')),
     'not all child processes started',
@@ -281,6 +375,7 @@ Future<void> _verifyEmptyPipelineProgress(Directory root) async {
       ),
       log: (_) {},
     );
+    await Future<void>.delayed(Duration.zero);
     await subscription.cancel();
     _check(
       manager.snapshot.stage == PipelineStage.completed &&
@@ -340,10 +435,15 @@ void _verifyFfmpegProgressParser() {
   final parser = FFmpegProgressParser(
     onProgress: (value, _) => values.add(value),
   );
+  parser.addStdoutLine('out_time_us=2500000');
+  _check(values.isEmpty, 'progress emitted before duration was known');
   parser.addStderrLine(
     'Input #0, mov, from \'clip.mov\': Duration: 00:00:10.00, start: 0.0',
   );
-  parser.addStdoutLine('out_time_us=2500000');
+  _check(
+    values.length == 1 && (values.single - 0.25).abs() < 0.0001,
+    'buffered FFmpeg progress was not emitted after duration arrived',
+  );
   parser.addStdoutLine('out_time_ms=5000000');
   parser.addStdoutLine('out_time_us=4000000');
   parser.addStdoutLine('progress=end');
@@ -354,6 +454,29 @@ void _verifyFfmpegProgressParser() {
   _check((values[0] - 0.25).abs() < 0.0001, 'out_time_us parsed incorrectly');
   _check((values[1] - 0.5).abs() < 0.0001, 'out_time_ms parsed incorrectly');
   _check(values[2] == 1, 'FFmpeg end marker did not complete progress');
+}
+
+void _verifyLogSeverityClassification() {
+  _check(
+    classifyLogSeverity('[ERROR] connection refused') == LogSeverity.error,
+    'ERROR prefix was not classified as error',
+  );
+  _check(
+    classifyLogSeverity('WARN: retrying upload') == LogSeverity.warning,
+    'WARN prefix was not classified as warning',
+  );
+  _check(
+    classifyLogSeverity('request complete') == LogSeverity.info,
+    'ordinary console output was not classified as info',
+  );
+  _check(
+    const PipelineFileTask(
+      name: 'photo.jpg',
+      progress: null,
+      status: '重试 1/2',
+    ).isActive,
+    'retry wait was not counted as an active worker',
+  );
 }
 
 Future<void> _verifyUploadRetry(Directory root) async {
@@ -381,6 +504,48 @@ Future<void> _verifyUploadRetry(Directory root) async {
   _check(
     logs.any((line) => line.contains('1/1 次重试')),
     'retry was missing from pipeline logs',
+  );
+}
+
+Future<void> _verifyRetryDoesNotRegressOverallProgress(Directory root) async {
+  final source = Directory(p.join(root.path, 'retry-progress-source'))
+    ..createSync();
+  await File(p.join(source.path, 'large.jpg')).writeAsString('x' * 100);
+  final oss = _FakeOss(
+    expectedFirstBatch: 1,
+    failFirst: true,
+    failFirstAfterProgress: true,
+  );
+  final manager = PipelineManager(oss: oss, runner: ProcessRunner());
+  final snapshots = <PipelineSnapshot>[];
+  final subscription = manager.events.listen(snapshots.add);
+  await manager.run(
+    AppConfig(
+      sourcePath: source.path,
+      workspacePath: p.join(root.path, 'retry-progress-workspace'),
+      videoExtensions: const ['.mov'],
+      uploadConcurrency: 1,
+      uploadRetries: 1,
+    ),
+    log: (_) {},
+  );
+  await Future<void>.delayed(Duration.zero);
+  await subscription.cancel();
+
+  _check(oss.started == 2, 'failed upload attempt was not retried');
+  final uploading = snapshots
+      .where((snapshot) => snapshot.stage == PipelineStage.uploading)
+      .toList();
+  for (var index = 1; index < uploading.length; index++) {
+    _check(
+      uploading[index].overall + 0.000001 >= uploading[index - 1].overall,
+      'overall progress regressed when an upload was retried',
+    );
+  }
+  _check(
+    manager.snapshot.stage == PipelineStage.completed &&
+        manager.snapshot.overall == 1,
+    'retried upload did not complete the pipeline',
   );
 }
 
@@ -434,6 +599,7 @@ Future<void> _verifyTranscodeProgressIsByteWeighted(Directory root) async {
     ..createSync();
   await File(p.join(source.path, 'small.mov')).writeAsString('x');
   await File(p.join(source.path, 'large.mov')).writeAsString('x' * 99);
+  await File(p.join(source.path, 'empty.mov')).writeAsBytes(const []);
   final manager = PipelineManager(
     ffmpeg: _FakeFfmpeg(),
     oss: _FakeOss(expectedFirstBatch: 1),
@@ -458,20 +624,24 @@ Future<void> _verifyTranscodeProgressIsByteWeighted(Directory root) async {
     ),
     log: (_) {},
   );
+  await Future<void>.delayed(Duration.zero);
   await subscription.cancel();
 
-  _check(
-    twentyPercent.length == 2,
-    'did not receive one progress update per transcoded video',
-  );
+  _check(twentyPercent.length == 3, 'did not receive progress per video');
+  var completedWeight = 0;
   for (final snapshot in twentyPercent) {
     final basename = p.basename(snapshot.currentFile);
-    final sourceBytes = basename == 'small.mov' ? 1 : 99;
-    final expected = 0.30 + (sourceBytes / 100 * 0.20 * 0.30);
+    final weight = switch (basename) {
+      'small.mov' => 1,
+      'large.mov' => 99,
+      _ => 1,
+    };
+    final expected = 0.30 + ((completedWeight + weight * 0.20) / 101 * 0.30);
     _check(
       (snapshot.overall - expected).abs() < 0.000001,
-      'transcode overall progress was not weighted by source file size',
+      'transcode overall progress was not weighted by source file size: ${snapshot.currentFile} ${snapshot.overall} != $expected',
     );
+    completedWeight += weight;
   }
 }
 
@@ -480,6 +650,7 @@ Future<void> _verifyUploadProgressIsByteWeighted(Directory root) async {
     ..createSync();
   await File(p.join(source.path, 'small.jpg')).writeAsString('x');
   await File(p.join(source.path, 'large.jpg')).writeAsString('x' * 99);
+  await File(p.join(source.path, 'empty.jpg')).writeAsBytes(const []);
   final manager = PipelineManager(
     oss: _FakeOss(expectedFirstBatch: 1),
     runner: ProcessRunner(),
@@ -502,20 +673,24 @@ Future<void> _verifyUploadProgressIsByteWeighted(Directory root) async {
     ),
     log: (_) {},
   );
+  await Future<void>.delayed(Duration.zero);
   await subscription.cancel();
 
-  _check(
-    quarterProgress.length == 2,
-    'did not receive one quarter-progress update per uploaded file',
-  );
+  _check(quarterProgress.length == 3, 'did not receive progress per upload');
+  var completedWeight = 0;
   for (final snapshot in quarterProgress) {
     final basename = p.basename(snapshot.currentFile);
-    final fileBytes = basename == 'small.jpg' ? 1 : 99;
-    final expected = 0.60 + (fileBytes / 100 * 0.25 * 0.40);
+    final weight = switch (basename) {
+      'small.jpg' => 1,
+      'large.jpg' => 99,
+      _ => 1,
+    };
+    final expected = 0.60 + ((completedWeight + weight * 0.25) / 101 * 0.40);
     _check(
       (snapshot.overall - expected).abs() < 0.000001,
-      'upload overall progress was not weighted by the current file size',
+      'upload overall progress was not weighted by the current file size: $basename ${snapshot.overall} != $expected',
     );
+    completedWeight += weight;
   }
 }
 
@@ -569,6 +744,7 @@ Future<void> _verifyParallelPauseResume(Directory root) async {
     runner: ProcessRunner(),
   );
   final observedProgress = <double>[];
+  final controlLogs = <String>[];
   final subscription = manager.events.listen(
     (snapshot) => observedProgress.add(snapshot.overall),
   );
@@ -580,7 +756,7 @@ Future<void> _verifyParallelPauseResume(Directory root) async {
       transcodeConcurrency: 2,
       uploadConcurrency: 3,
     ),
-    log: (_) {},
+    log: controlLogs.add,
   );
 
   await oss.firstBatchStarted.future.timeout(const Duration(seconds: 5));
@@ -605,6 +781,11 @@ Future<void> _verifyParallelPauseResume(Directory root) async {
   );
   _check(oss.maxActive == 3, 'configured upload parallelism was not respected');
   _check(oss.started == 12, 'expected all 12 workspace files to upload');
+  _check(
+    controlLogs.any((line) => line.contains('收到暂停请求')) &&
+        controlLogs.any((line) => line.contains('任务已恢复')),
+    'pause/resume actions were not written to the global log',
+  );
   _check(
     await staleFile.exists(),
     'new pipeline run modified a stale workspace file',
@@ -664,6 +845,7 @@ Future<void> _verifyCancellationStopsDispatch(Directory root) async {
   }
   final oss = _FakeOss(expectedFirstBatch: 3);
   final manager = PipelineManager(oss: oss, runner: ProcessRunner());
+  final cancelLogs = <String>[];
   final run = manager.run(
     AppConfig(
       sourcePath: source.path,
@@ -672,7 +854,7 @@ Future<void> _verifyCancellationStopsDispatch(Directory root) async {
       uploadConcurrency: 3,
       uploadRetries: 0,
     ),
-    log: (_) {},
+    log: cancelLogs.add,
   );
   await oss.firstBatchStarted.future.timeout(const Duration(seconds: 5));
   await manager.cancel();
@@ -684,6 +866,11 @@ Future<void> _verifyCancellationStopsDispatch(Directory root) async {
   _check(
     oss.started == 3,
     'cancel dispatched additional files after the active batch',
+  );
+  _check(
+    cancelLogs.any((line) => line.contains('收到取消请求')) &&
+        cancelLogs.any((line) => line == '任务已取消'),
+    'cancel request and terminal result were not both logged',
   );
 }
 
@@ -730,10 +917,12 @@ class _FakeOss extends OssService {
   _FakeOss({
     required this.expectedFirstBatch,
     this.failFirst = false,
+    this.failFirstAfterProgress = false,
     this.holdUntil,
   }) : super(ProcessRunner());
   final int expectedFirstBatch;
   final bool failFirst;
+  final bool failFirstAfterProgress;
   final Future<void>? holdUntil;
   final firstBatchStarted = Completer<void>();
   var started = 0;
@@ -756,13 +945,16 @@ class _FakeOss extends OssService {
     }
     try {
       await holdUntil;
-      if (failFirst && call == 1) {
+      if (failFirst && call == 1 && !failFirstAfterProgress) {
         await Future<void>.delayed(const Duration(milliseconds: 5));
         throw StateError('simulated upload failure');
       }
       progress(0.25, 'upload 25%');
       await Future<void>.delayed(const Duration(milliseconds: 35));
       progress(0.75, 'upload 75%');
+      if (failFirst && call == 1 && failFirstAfterProgress) {
+        throw StateError('simulated late upload failure');
+      }
       progress(0.4, 'upload 40% (late log)');
       await Future<void>.delayed(const Duration(milliseconds: 15));
       progress(1, 'upload complete');

@@ -26,6 +26,7 @@ class PipelineManager {
   final _events = StreamController<PipelineSnapshot>.broadcast();
   Stream<PipelineSnapshot> get events => _events.stream;
   PauseGate? _gate;
+  LogCallback? _activeLog;
   bool get running => _gate != null;
   PipelineSnapshot _snapshot = const PipelineSnapshot();
   PipelineSnapshot get snapshot => _snapshot;
@@ -34,6 +35,7 @@ class PipelineManager {
     final gate = _gate;
     if (gate == null || gate.paused) return;
     gate.pause();
+    _activeLog?.call('收到暂停请求；当前文件完成后暂停派发');
     _emit(_snapshot.copyWith(paused: true));
   }
 
@@ -41,10 +43,12 @@ class PipelineManager {
     final gate = _gate;
     if (gate == null || !gate.paused) return;
     gate.resume();
+    _activeLog?.call('任务已恢复，继续派发文件');
     _emit(_snapshot.copyWith(paused: false));
   }
 
   Future<void> cancel() async {
+    if (_gate != null) _activeLog?.call('收到取消请求；正在终止活动进程');
     _gate?.cancel();
     await _runner.terminate();
   }
@@ -64,6 +68,7 @@ class PipelineManager {
   Future<void> run(AppConfig config, {required LogCallback log}) async {
     if (running) throw StateError('任务正在运行');
     final gate = _gate = PauseGate();
+    _activeLog = log;
     const copyWeight = 0.30;
     const transcodeWeight = 0.30;
     final uploadWeight = config.deleteAfterUpload ? 0.35 : 0.40;
@@ -100,7 +105,13 @@ class PipelineManager {
       ),
     );
     final terminalTaskStatuses = {'已复制', '已转码', '已上传', '失败', '已中止'};
-    void setTask(String key, String name, double? progress, String status) {
+    void setTask(
+      String key,
+      String name,
+      double? progress,
+      String status, {
+      bool emit = true,
+    }) {
       taskStates[key] = PipelineFileTask(
         name: name,
         progress: progress?.clamp(0, 1).toDouble(),
@@ -113,6 +124,7 @@ class PipelineManager {
         if (finished.isEmpty) break;
         taskStates.remove(finished.first.key);
       }
+      if (!emit) return;
       update(
         _snapshot.stage,
         _snapshot.overall,
@@ -145,8 +157,13 @@ class PipelineManager {
         concurrency: config.copyConcurrency,
         gate: gate,
         log: report,
-        onTask: (name, value, status) =>
-            setTask('copy:$name', name, status == '复制中' ? null : value, status),
+        onTask: (name, value, status) => setTask(
+          'copy:$name',
+          name,
+          status == '复制中' ? null : value,
+          status,
+          emit: status != '已复制',
+        ),
         onFileScanned: (relativePath, size) =>
             sourceFileSizes[relativePath] = size,
         onScan: (discovered, complete, totalBytes) {
@@ -224,7 +241,7 @@ class PipelineManager {
                 totalVideoProgress +=
                     (stableValue - videoProgress[index]) * videoWeights[index];
                 videoProgress[index] = stableValue;
-                setTask(taskKey, name, stableValue, '转码中');
+                setTask(taskKey, name, stableValue, '转码中', emit: false);
                 final fraction = totalVideoWeight == 0
                     ? 1.0
                     : totalVideoProgress / totalVideoWeight;
@@ -243,7 +260,7 @@ class PipelineManager {
                 (1 - videoProgress[index]) * videoWeights[index];
             videoProgress[index] = 1;
             transcoded++;
-            setTask(taskKey, name, 1, '已转码');
+            setTask(taskKey, name, 1, '已转码', emit: false);
             update(
               PipelineStage.transcoding,
               transcodeStart +
@@ -297,9 +314,9 @@ class PipelineManager {
         message: '统计 $count 个文件大小',
       );
       final uploadFileSizes = await _measureFileSizes(workspaceFiles, gate);
-      final totalUploadBytes = uploadFileSizes.fold<int>(
+      final totalUploadWorkUnits = uploadFileSizes.fold<int>(
         0,
-        (sum, size) => sum + size,
+        (sum, size) => sum + (size > 0 ? size : 1),
       );
       update(
         PipelineStage.uploading,
@@ -311,18 +328,17 @@ class PipelineManager {
       var stopScheduling = false;
       Object? uploadFailure;
       final uploadProgress = List<double>.filled(count, 0);
+      final effectiveUploadProgress = List<double>.filled(count, 0);
       var totalUploadProgress = 0.0;
       double uploadFraction() {
         if (count == 0) return 1;
-        if (totalUploadBytes == 0) {
-          return uploadProgress.fold<double>(0, (sum, value) => sum + value) /
-              count;
-        }
-        return (totalUploadProgress / totalUploadBytes).clamp(0, 1).toDouble();
+        return (totalUploadProgress / totalUploadWorkUnits)
+            .clamp(0, 1)
+            .toDouble();
       }
 
       double progressWeight(int index) =>
-          totalUploadBytes == 0 ? 1 : uploadFileSizes[index].toDouble();
+          (uploadFileSizes[index] > 0 ? uploadFileSizes[index] : 1).toDouble();
 
       final retryLimit = config.uploadRetries.clamp(0, 5).toInt();
       Future<void> uploadWorker() async {
@@ -341,8 +357,7 @@ class PipelineManager {
                 setTask('upload:$index', name, uploadProgress[index], '已中止');
                 return;
               }
-              totalUploadProgress -=
-                  uploadProgress[index] * progressWeight(index);
+              // 新尝试的单文件条从 0 重新显示；总体任务保持最高有效进度，避免回退。
               uploadProgress[index] = 0;
               setTask('upload:$index', name, null, '重试 $attempt/$retryLimit');
               report(
@@ -385,12 +400,23 @@ class PipelineManager {
                   final stableValue = value
                       .clamp(uploadProgress[index], 1)
                       .toDouble();
+                  final effectiveValue =
+                      stableValue > effectiveUploadProgress[index]
+                      ? stableValue
+                      : effectiveUploadProgress[index];
                   totalUploadProgress +=
-                      (stableValue - uploadProgress[index]) *
+                      (effectiveValue - effectiveUploadProgress[index]) *
                       progressWeight(index);
                   uploadProgress[index] = stableValue;
+                  effectiveUploadProgress[index] = effectiveValue;
                   final totalProgress = uploadFraction();
-                  setTask('upload:$index', name, stableValue, '上传中');
+                  setTask(
+                    'upload:$index',
+                    name,
+                    stableValue,
+                    '上传中',
+                    emit: false,
+                  );
                   update(
                     PipelineStage.uploading,
                     uploadStart + totalProgress * uploadWeight,
@@ -421,10 +447,11 @@ class PipelineManager {
           }
           if (fileError == null) {
             totalUploadProgress +=
-                (1 - uploadProgress[index]) * progressWeight(index);
+                (1 - effectiveUploadProgress[index]) * progressWeight(index);
             uploadProgress[index] = 1;
+            effectiveUploadProgress[index] = 1;
             uploaded++;
-            setTask('upload:$index', name, 1, '已上传');
+            setTask('upload:$index', name, 1, '已上传', emit: false);
             update(
               PipelineStage.uploading,
               uploadStart + uploadFraction() * uploadWeight,
@@ -488,6 +515,7 @@ class PipelineManager {
       rethrow;
     } finally {
       _gate = null;
+      _activeLog = null;
     }
   }
 

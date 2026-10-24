@@ -9,6 +9,7 @@ class ConfigRepository {
 
   /// 可注入配置目录以隔离测试；生产环境使用用户应用数据目录。
   final Directory? rootDirectory;
+  Future<void> _saveQueue = Future<void>.value();
 
   Future<File> get file async {
     final dir =
@@ -31,6 +32,25 @@ class ConfigRepository {
     }
   }
 
-  Future<void> save(AppConfig config) async =>
-      (await file).writeAsString(config.toPrettyJson());
+  Future<void> save(AppConfig config) {
+    final operation = _saveQueue.then((_) => _saveNow(config));
+    // 一个保存失败不应阻塞后续用户再次保存。
+    _saveQueue = operation.catchError((Object _) {});
+    return operation;
+  }
+
+  Future<void> _saveNow(AppConfig config) async {
+    final target = await file;
+    final temporary = File(
+      '${target.path}.tmp.${DateTime.now().microsecondsSinceEpoch}',
+    );
+    try {
+      await temporary.writeAsString(config.toPrettyJson(), flush: true);
+      await temporary.rename(target.path);
+    } finally {
+      if (await temporary.exists()) {
+        await temporary.delete();
+      }
+    }
+  }
 }

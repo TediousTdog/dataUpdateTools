@@ -83,6 +83,7 @@ class FFmpegProgressParser {
   FFmpegProgressParser({required this.onProgress});
   final ProgressCallback onProgress;
   double? _durationSeconds;
+  int? _outTimeMicroseconds;
   double _lastProgress = -1;
 
   void addStdoutLine(String line) {
@@ -90,18 +91,9 @@ class FFmpegProgressParser {
     if (split < 0) return;
     final key = line.substring(0, split), value = line.substring(split + 1);
     if (key == 'out_time_us' || key == 'out_time_ms') {
-      final microseconds = int.tryParse(value);
-      final duration = _durationSeconds;
-      if (microseconds != null && duration != null && duration > 0) {
-        // FFmpeg 的 out_time_ms 历史字段单位也是微秒；新版同时提供 out_time_us。
-        final fraction = (microseconds / 1000000 / duration)
-            .clamp(0, 0.999)
-            .toDouble();
-        if (fraction > _lastProgress) {
-          _lastProgress = fraction;
-          onProgress(fraction, '转码 ${(fraction * 100).toStringAsFixed(1)}%');
-        }
-      }
+      // FFmpeg 的 out_time_ms 历史字段单位也是微秒；新版同时提供 out_time_us。
+      _outTimeMicroseconds = int.tryParse(value) ?? _outTimeMicroseconds;
+      _emitTimeProgress();
     } else if (key == 'progress' && value == 'end') {
       if (_lastProgress < 1) {
         _lastProgress = 1;
@@ -119,7 +111,20 @@ class FFmpegProgressParser {
           int.parse(match[1]!) * 3600 +
           int.parse(match[2]!) * 60 +
           double.parse(match[3]!);
+      _emitTimeProgress();
     }
+  }
+
+  void _emitTimeProgress() {
+    final microseconds = _outTimeMicroseconds;
+    final duration = _durationSeconds;
+    if (microseconds == null || duration == null || duration <= 0) return;
+    final fraction = (microseconds / 1000000 / duration)
+        .clamp(0, 0.999)
+        .toDouble();
+    if (fraction <= _lastProgress) return;
+    _lastProgress = fraction;
+    onProgress(fraction, '转码 ${(fraction * 100).toStringAsFixed(1)}%');
   }
 }
 

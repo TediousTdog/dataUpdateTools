@@ -62,7 +62,9 @@ class PipelineFileTask {
   final double? progress;
   final String status;
 
-  bool get isActive => const {'复制中', '转码中', '上传中', '重试上传中'}.contains(status);
+  bool get isActive =>
+      const {'复制中', '转码中', '上传中', '重试上传中'}.contains(status) ||
+      status.startsWith('重试 ');
 }
 
 typedef LogCallback = void Function(String message);

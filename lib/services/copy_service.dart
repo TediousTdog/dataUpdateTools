@@ -28,6 +28,7 @@ class CopyService {
     final files = <File>[];
     final fileSizes = <int>[];
     var totalBytes = 0;
+    var totalWorkUnits = 0;
     var nextScanReport = 100;
     await for (final entity in src.list(recursive: true, followLinks: false)) {
       await gate.checkpoint();
@@ -36,6 +37,7 @@ class CopyService {
         files.add(entity);
         fileSizes.add(size);
         totalBytes += size;
+        totalWorkUnits += size > 0 ? size : 1;
         onFileScanned(p.relative(entity.path, from: source), size);
       }
       if (files.length >= nextScanReport) {
@@ -46,7 +48,7 @@ class CopyService {
     log('扫描完成：${files.length} 个文件');
     onScan(files.length, true, totalBytes);
     var next = 0, done = 0;
-    var copiedBytes = 0;
+    var copiedWorkUnits = 0;
     var stopScheduling = false;
     Object? copyFailure;
     final copied = <File>[];
@@ -67,18 +69,19 @@ class CopyService {
           await _copyFile(sourceFile, target.path);
           copied.add(target);
           done++;
-          copiedBytes += fileSizes[index];
+          copiedWorkUnits += fileSizes[index] > 0 ? fileSizes[index] : 1;
           onTask(name, 1, '已复制');
           progress(
-            totalBytes > 0
-                ? copiedBytes / totalBytes
+            totalWorkUnits > 0
+                ? copiedWorkUnits / totalWorkUnits
                 : (files.isEmpty ? 1 : done / files.length),
             p.basename(sourceFile.path),
             done,
             files.length,
           );
         } catch (error) {
-          onTask(name, 0, '失败');
+          onTask(name, 0, gate.cancelled ? '已中止' : '失败');
+          if (gate.cancelled) return;
           copyFailure ??= error;
           stopScheduling = true;
           gate.resume();
