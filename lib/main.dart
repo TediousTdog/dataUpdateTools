@@ -1,7 +1,9 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'services/config_repository.dart';
 import 'services/log_store.dart';
 import 'services/pipeline_manager.dart';
+import 'services/demo_pipeline_manager.dart';
 import 'ui/pipeline_page.dart';
 
 void main() {
@@ -15,11 +17,14 @@ class PhotoIngestApp extends StatelessWidget {
     this.configRepository,
     this.logStore,
     this.pipelineManager,
+    this.demoMode,
   });
 
   final ConfigRepository? configRepository;
   final LogStore? logStore;
   final PipelineManager? pipelineManager;
+  /// macOS 演示默认开启；传入值可在测试或正式构建中覆盖。
+  final bool? demoMode;
 
   @override
   Widget build(BuildContext context) => MaterialApp(
@@ -38,6 +43,8 @@ class PhotoIngestApp extends StatelessWidget {
       configRepository: configRepository,
       logStore: logStore,
       pipelineManager: pipelineManager,
+      demoMode: demoMode ?? Platform.isMacOS,
+      demoPipelineManager: demoMode == false ? null : DemoPipelineManager(),
     ),
   );
 }

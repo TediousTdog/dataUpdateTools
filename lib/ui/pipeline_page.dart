@@ -9,6 +9,7 @@ import '../services/log_store.dart';
 import '../services/log_severity.dart';
 import '../services/pipeline_manager.dart';
 import '../services/pipeline_types.dart';
+import '../services/demo_pipeline_manager.dart';
 
 class PipelinePage extends StatefulWidget {
   const PipelinePage({
@@ -16,11 +17,15 @@ class PipelinePage extends StatefulWidget {
     this.configRepository,
     this.logStore,
     this.pipelineManager,
+    this.demoMode = false,
+    this.demoPipelineManager,
   });
 
   final ConfigRepository? configRepository;
   final LogStore? logStore;
   final PipelineManager? pipelineManager;
+  final bool demoMode;
+  final DemoPipelineManager? demoPipelineManager;
 
   @override
   State<PipelinePage> createState() => _PipelinePageState();
@@ -31,7 +36,7 @@ enum _LogFilter { all, info, warning, error }
 class _PipelinePageState extends State<PipelinePage> {
   late final ConfigRepository _repo;
   late final LogStore _logStore;
-  late final PipelineManager _manager;
+  late final dynamic _manager;
   final _formKey = GlobalKey<FormState>();
   final _controllers = <String, TextEditingController>{};
   final _logs = <String>[];
@@ -116,7 +121,9 @@ class _PipelinePageState extends State<PipelinePage> {
     super.initState();
     _repo = widget.configRepository ?? ConfigRepository();
     _logStore = widget.logStore ?? LogStore();
-    _manager = widget.pipelineManager ?? PipelineManager();
+    _manager = widget.demoMode
+        ? (widget.demoPipelineManager ?? DemoPipelineManager())
+        : (widget.pipelineManager ?? PipelineManager());
     _logScrollController = ScrollController()
       ..addListener(() {
         if (!_logScrollController.hasClients) return;
@@ -243,6 +250,7 @@ class _PipelinePageState extends State<PipelinePage> {
   }
 
   Future<void> _pickExecutable(String key, String title) async {
+    if (widget.demoMode) return;
     if (_manager.running || _starting) return;
     final result = await FilePicker.platform.pickFiles(
       dialogTitle: title,
@@ -322,6 +330,13 @@ class _PipelinePageState extends State<PipelinePage> {
     if (mounted) setState(() => _starting = true);
     try {
       _config = _readForm();
+      if (widget.demoMode) {
+        _append('macOS 演示模式：跳过真实目录、授权码和外部程序校验');
+        final run = _manager.run(_config, log: _append);
+        _activeRun = run;
+        await run;
+        return;
+      }
       final requiredFields = <String, String>{
         'sourcePath': '源目录',
         'workspacePath': '本地工作区',
@@ -509,7 +524,19 @@ class _PipelinePageState extends State<PipelinePage> {
     final busy = running || _starting;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('媒体归档工作台'),
+        title: Row(
+          children: [
+            const Text('媒体归档工作台'),
+            if (widget.demoMode) ...[
+              const SizedBox(width: 10),
+              Chip(
+                avatar: Icon(Icons.visibility_outlined, size: 16),
+                label: Text('演示模式'),
+                visualDensity: VisualDensity.compact,
+              ),
+            ],
+          ],
+        ),
         actions: [
           IconButton(
             tooltip: '保存配置',
@@ -537,6 +564,7 @@ class _PipelinePageState extends State<PipelinePage> {
   Widget _configPanel() {
     final busy = _manager.running || _starting;
     final visibleFields = _fields
+        .where((field) => !widget.demoMode || !{'ffmpegPath', 'ossutilPath', 'accessKeyId', 'accessKeySecret', 'securityToken'}.contains(field.$1))
         .where((field) => _showAdvanced || !_advancedKeys.contains(field.$1))
         .toList(growable: false);
     final specialCount = 6;
@@ -804,14 +832,14 @@ class _PipelinePageState extends State<PipelinePage> {
                           : () => _pickDirectory(key, '选择本地工作区'),
                       icon: const Icon(Icons.folder_open_outlined),
                     ),
-                    'ffmpegPath' => IconButton(
+                    'ffmpegPath' when !widget.demoMode => IconButton(
                       tooltip: '选择 ffmpeg.exe',
                       onPressed: busy
                           ? null
                           : () => _pickExecutable(key, '选择 ffmpeg.exe'),
                       icon: const Icon(Icons.video_file_outlined),
                     ),
-                    'ossutilPath' => IconButton(
+                    'ossutilPath' when !widget.demoMode => IconButton(
                       tooltip: '选择 ossutil.exe',
                       onPressed: busy
                           ? null
