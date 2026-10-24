@@ -36,7 +36,7 @@ class FFmpegService {
       'pipe:1',
       '-i',
       input.path,
-      ..._splitArgs(argumentTemplate),
+      ...parseArgumentTemplate(argumentTemplate),
       output,
     ];
     final code = await runner.run(
@@ -128,25 +128,26 @@ class FFmpegProgressParser {
   }
 }
 
-/// 解析常见的带双引号/单引号参数模板，不做 shell 展开；不会执行变量或命令替换。
-List<String> _splitArgs(String value) {
+/// 解析带引号的 argv 模板，不做 shell 展开，也不执行变量或命令替换。
+/// 引号内的 Windows 路径反斜杠会保留；只有反斜杠后接引号或反斜杠时才作为转义符。
+List<String> parseArgumentTemplate(String value) {
   final result = <String>[];
   final buffer = StringBuffer();
+  final characters = value.runes.map(String.fromCharCode).toList();
   String? quote;
-  var escaped = false;
-  for (final char in value.runes.map(String.fromCharCode)) {
-    if (escaped) {
-      buffer.write(char);
-      escaped = false;
-      continue;
-    }
-    if (char == r'\' && quote != null) {
-      escaped = true;
-      continue;
-    }
+  for (var index = 0; index < characters.length; index++) {
+    final char = characters[index];
     if (quote != null) {
       if (char == quote) {
         quote = null;
+      } else if (char == r'\' && index + 1 < characters.length) {
+        final next = characters[index + 1];
+        if (next == quote || next == r'\') {
+          buffer.write(next);
+          index++;
+        } else {
+          buffer.write(char);
+        }
       } else {
         buffer.write(char);
       }
