@@ -43,6 +43,7 @@ Future<void> main() async {
     await _verifyCleanupPoolPauseAndLimit(root);
     await _verifyCleanupFailureStopsScheduling(root);
     await _verifyCleanupCancellationDrainsCurrentFiles(root);
+    await _verifyCleanupRejectsOutsideFiles(root);
     await _verifyCleanupIsScopedToCurrentRun(root);
     stdout.writeln('Pipeline smoke checks passed.');
   } finally {
@@ -679,6 +680,35 @@ Future<void> _verifyCleanupFailureStopsScheduling(Directory root) async {
         manager.snapshot.activeTaskCount == 0 &&
         manager.snapshot.activeTasks.any((task) => task.status == '失败'),
     'cleanup failure did not reach a terminal UI state',
+  );
+}
+
+Future<void> _verifyCleanupRejectsOutsideFiles(Directory root) async {
+  final runDirectory = Directory(p.join(root.path, 'cleanup-guard-run'))
+    ..createSync();
+  final outsideFile = File(p.join(root.path, 'cleanup-guard-outside.txt'));
+  await outsideFile.writeAsString('must remain');
+  var rejected = false;
+  try {
+    await CleanupService().cleanRun(
+      rootPath: runDirectory.path,
+      files: [outsideFile],
+      concurrency: 1,
+      gate: PauseGate(),
+      onTask: (_, _, _) {},
+      onProgress: (_, _, _) {},
+    );
+  } on ArgumentError {
+    rejected = true;
+  }
+  _check(rejected, 'cleanup accepted a file outside its run directory');
+  _check(
+    await outsideFile.readAsString() == 'must remain',
+    'outside file changed',
+  );
+  _check(
+    await runDirectory.exists(),
+    'rejected cleanup removed its run directory',
   );
 }
 
