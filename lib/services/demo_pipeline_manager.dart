@@ -51,16 +51,18 @@ class DemoPipelineManager {
     _timer = null;
     _running = false;
     _log?.call('演示任务已取消');
-    _emit(PipelineSnapshot(
-      stage: PipelineStage.cancelled,
-      overall: _snapshot.overall,
-      fileProgress: _snapshot.fileProgress,
-      currentFile: _snapshot.currentFile,
-      completedFiles: _snapshot.completedFiles,
-      totalFiles: _snapshot.totalFiles,
-      message: '演示任务已取消',
-      originStage: _snapshot.stage,
-    ));
+    _emit(
+      PipelineSnapshot(
+        stage: PipelineStage.cancelled,
+        overall: _snapshot.overall,
+        fileProgress: _snapshot.fileProgress,
+        currentFile: _snapshot.currentFile,
+        completedFiles: _snapshot.completedFiles,
+        totalFiles: _snapshot.totalFiles,
+        message: '演示任务已取消',
+        originStage: _snapshot.stage,
+      ),
+    );
   }
 
   Future<void> run(AppConfig config, {required LogCallback log}) async {
@@ -104,7 +106,9 @@ class DemoPipelineManager {
       final stage = stages[stageIndex];
       final name = files[fileIndex];
       final completed = stageIndex * files.length + fileIndex;
-      final overall = ((completed + fileProgress) / totalSteps).clamp(0, 1).toDouble();
+      final overall = ((completed + fileProgress) / totalSteps)
+          .clamp(0, 1)
+          .toDouble();
       final action = switch (stage) {
         PipelineStage.copying => '复制',
         PipelineStage.transcoding => '转码',
@@ -112,17 +116,25 @@ class DemoPipelineManager {
         PipelineStage.cleaning => '清理',
         _ => '处理',
       };
-      _emit(PipelineSnapshot(
-        stage: stage,
-        overall: overall,
-        fileProgress: fileProgress,
-        currentFile: name,
-        completedFiles: completed,
-        totalFiles: files.length,
-        message: '$action ${fileIndex + 1}/${files.length}',
-        activeTasks: [PipelineFileTask(name: name, progress: fileProgress, status: '${action}中')],
-        activeTaskCount: 1,
-      ));
+      _emit(
+        PipelineSnapshot(
+          stage: stage,
+          overall: overall,
+          fileProgress: fileProgress,
+          currentFile: name,
+          completedFiles: completed,
+          totalFiles: files.length,
+          message: '$action ${fileIndex + 1}/${files.length}',
+          activeTasks: [
+            PipelineFileTask(
+              name: name,
+              progress: fileProgress,
+              status: '$action中',
+            ),
+          ],
+          activeTaskCount: 1,
+        ),
+      );
       if (fileProgress < 1) return;
       log('[演示] $action 完成：$name');
       fileProgress = 0;
@@ -144,14 +156,16 @@ class DemoPipelineManager {
       _timer = null;
       _running = false;
       log('演示任务完成：所有阶段均已模拟');
-      _emit(PipelineSnapshot(
-        stage: PipelineStage.completed,
-        overall: 1,
-        fileProgress: 1,
-        completedFiles: files.length,
-        totalFiles: files.length,
-        message: '演示完成',
-      ));
+      _emit(
+        PipelineSnapshot(
+          stage: PipelineStage.completed,
+          overall: 1,
+          fileProgress: 1,
+          completedFiles: files.length,
+          totalFiles: files.length,
+          message: '演示完成',
+        ),
+      );
       done.complete();
     });
     await done.future;

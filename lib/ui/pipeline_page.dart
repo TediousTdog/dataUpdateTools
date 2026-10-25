@@ -10,6 +10,8 @@ import '../services/log_severity.dart';
 import '../services/pipeline_manager.dart';
 import '../services/pipeline_types.dart';
 import '../services/demo_pipeline_manager.dart';
+import '../services/oss_service.dart';
+import '../services/process_runner.dart';
 
 class PipelinePage extends StatefulWidget {
   const PipelinePage({
@@ -37,6 +39,7 @@ class _PipelinePageState extends State<PipelinePage> {
   late final ConfigRepository _repo;
   late final LogStore _logStore;
   late final dynamic _manager;
+  late final OssService _ossBrowser;
   final _formKey = GlobalKey<FormState>();
   final _controllers = <String, TextEditingController>{};
   final _logs = <String>[];
@@ -63,6 +66,9 @@ class _PipelinePageState extends State<PipelinePage> {
   bool _disposed = false;
   bool _starting = false;
   bool _showAdvanced = false;
+  bool _ossListing = false;
+  List<String> _ossEntries = const [];
+  String? _ossListingError;
 
   static const _advancedKeys = <String>{
     'endpoint',
@@ -94,7 +100,7 @@ class _PipelinePageState extends State<PipelinePage> {
     ('sourcePath', '读卡器源目录', false),
     ('workspacePath', '本地工作区', false),
     ('bucket', 'OSS Bucket', false),
-    ('prefix', 'OSS 对象前缀', false),
+    ('prefix', 'OSS 上传路径（子目录）', false),
     ('endpoint', 'OSS Endpoint', false),
     ('authorizationCode', 'OSS 授权码（Base64 JSON）', true),
     ('accessKeyId', 'AccessKey ID', false),
@@ -124,6 +130,7 @@ class _PipelinePageState extends State<PipelinePage> {
     _manager = widget.demoMode
         ? (widget.demoPipelineManager ?? DemoPipelineManager())
         : (widget.pipelineManager ?? PipelineManager());
+    _ossBrowser = OssService(ProcessRunner());
     _logScrollController = ScrollController()
       ..addListener(() {
         if (!_logScrollController.hasClients) return;
@@ -202,10 +209,10 @@ class _PipelinePageState extends State<PipelinePage> {
     return _config.copyWith(
       sourcePath: _text('sourcePath'),
       workspacePath: _text('workspacePath'),
-      // 若使用单个授权码，保存配置时不再将旧的手工凭证重复写入 JSON；
-      // 清除授权码后，界面中的手工值仍可继续作为兼容模式使用。
+      // 授权码只负责提供默认 Bucket/Endpoint/凭证；OSS 前缀允许用户单独覆盖，
+      // 这样可以把同一份授权码上传到不同的对象目录。
       bucket: useAuthorizationCode ? '' : _text('bucket'),
-      prefix: useAuthorizationCode ? '' : _text('prefix'),
+      prefix: _text('prefix'),
       endpoint: useAuthorizationCode ? '' : _text('endpoint'),
       authorizationCode: authorizationCode,
       accessKeyId: useAuthorizationCode ? '' : _text('accessKeyId'),
@@ -247,6 +254,72 @@ class _PipelinePageState extends State<PipelinePage> {
       selection: TextSelection.collapsed(offset: selected.length),
     );
     setState(() {});
+  }
+
+  Future<void> _selectOssPrefix() async {
+    if (_manager.running || _starting) return;
+    final controller = TextEditingController(text: _text('prefix'));
+    final value = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('选择 OSS 上传路径'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '对象前缀（子目录）',
+            hintText: '例如：照片/2026/10',
+            helperText: '不要填写 oss:// 和 Bucket，只填写 Bucket 后面的目录',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('使用此路径'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (!mounted || value == null) return;
+    _controllers['prefix']?.text = value;
+    setState(() {});
+  }
+
+  Future<void> _refreshOssListing() async {
+    if (_ossListing || _manager.running || _starting) return;
+    if (widget.demoMode) {
+      setState(() {
+        _ossEntries = const ['演示目录/照片/', '演示目录/视频/', '演示目录/README.txt'];
+        _ossListingError = null;
+      });
+      _append('演示模式：OSS 原目录列表为模拟数据');
+      return;
+    }
+    setState(() {
+      _ossListing = true;
+      _ossListingError = null;
+    });
+    try {
+      final config = _readForm().resolveAuthorization();
+      final entries = await _ossBrowser.listPrefix(
+        config: config,
+        onLog: (line) => _append('[OSS 目录] $line'),
+      );
+      if (!mounted) return;
+      setState(() => _ossEntries = entries);
+      _append('OSS 原目录读取完成：${entries.length} 条');
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _ossListingError = error.toString());
+      _append('OSS 原目录读取失败：$error');
+    } finally {
+      if (mounted) setState(() => _ossListing = false);
+    }
   }
 
   Future<void> _pickExecutable(String key, String title) async {
@@ -547,14 +620,183 @@ class _PipelinePageState extends State<PipelinePage> {
       ),
       body: Padding(
         padding: const EdgeInsets.all(20),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            SizedBox(width: 270, child: _locationPanel()),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Expanded(flex: 6, child: _configPanel()),
+                  const SizedBox(height: 16),
+                  _progressPanel(),
+                  const SizedBox(height: 16),
+                  Expanded(flex: 4, child: _logPanel()),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _locationPanel() {
+    final source = _text('sourcePath');
+    final workspace = _text('workspacePath');
+    var bucket = _text('bucket');
+    var endpoint = _text('endpoint');
+    if (_text('authorizationCode').isNotEmpty) {
+      try {
+        final auth = OssAuthorization.parse(_text('authorizationCode'));
+        bucket = auth.bucket;
+        endpoint = auth.endpoint;
+      } on FormatException catch (_) {
+        // 授权码错误时保留手动字段，并由配置区显示具体错误。
+      }
+    }
+    final prefix = _text('prefix').replaceAll(RegExp(r'^/+|/+$'), '');
+    final ossPath = bucket.isEmpty
+        ? '请先填写授权码或 Bucket'
+        : 'oss://$bucket${prefix.isEmpty ? '/' : '/$prefix/'}';
+    return Card(
+      elevation: 0,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Expanded(flex: 6, child: _configPanel()),
-            const SizedBox(height: 16),
-            _progressPanel(),
-            const SizedBox(height: 16),
-            Expanded(flex: 4, child: _logPanel()),
+            Row(
+              children: [
+                const Icon(Icons.account_tree_outlined, size: 20),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    '路径浏览',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '刷新路径信息',
+                  onPressed: _refreshOssListing,
+                  icon: const Icon(Icons.refresh, size: 18),
+                ),
+              ],
+            ),
+            const Divider(),
+            const Text('本地源目录'),
+            const SizedBox(height: 6),
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.sd_storage_outlined),
+              title: Text(
+                source.isEmpty ? '未选择' : source,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+              subtitle: const Text('读卡器 / 外接磁盘'),
+              onTap: () => _pickDirectory('sourcePath', '选择读卡器源目录'),
+            ),
+            const SizedBox(height: 8),
+            const Text('本地工作区'),
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.folder_copy_outlined),
+              title: Text(
+                workspace.isEmpty ? '未选择' : workspace,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+              subtitle: Text(_config.transcodeEnabled ? '转码临时目录' : '直传模式下不会使用'),
+              onTap: () => _pickDirectory('workspacePath', '选择本地工作区'),
+            ),
+            const Divider(height: 26),
+            const Text('OSS 目标目录'),
+            const SizedBox(height: 6),
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.cloud_outlined),
+              title: Text(
+                ossPath,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+              subtitle: Text(
+                endpoint.isEmpty ? '等待授权码解析' : endpoint,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (prefix.isNotEmpty)
+              Wrap(
+                spacing: 4,
+                runSpacing: 4,
+                children: [
+                  const Icon(Icons.home_work_outlined, size: 16),
+                  for (final segment in prefix.split('/'))
+                    Chip(
+                      label: Text(segment),
+                      visualDensity: VisualDensity.compact,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                ],
+              ),
+            OutlinedButton.icon(
+              onPressed: (_manager.running || _starting)
+                  ? null
+                  : _selectOssPrefix,
+              icon: const Icon(Icons.folder_open_outlined),
+              label: const Text('选择 OSS 路径'),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const Expanded(child: Text('OSS 原目录内容')),
+                if (_ossListing)
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            if (_ossListingError != null)
+              Text(
+                _ossListingError!,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              )
+            else if (_ossEntries.isEmpty)
+              const Text('点击右上角刷新读取 OSS 原目录', style: TextStyle(fontSize: 12))
+            else
+              Expanded(
+                child: ListView.builder(
+                  itemCount: _ossEntries.length,
+                  itemBuilder: (context, index) => Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Text(
+                      _ossEntries[index],
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ),
+              ),
+            const SizedBox(height: 10),
+            Text(
+              _config.transcodeEnabled
+                  ? '当前流程：源目录 → 本地工作区 → OSS'
+                  : '当前流程：源目录 → OSS（不复制）',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
           ],
         ),
       ),
@@ -564,7 +806,17 @@ class _PipelinePageState extends State<PipelinePage> {
   Widget _configPanel() {
     final busy = _manager.running || _starting;
     final visibleFields = _fields
-        .where((field) => !widget.demoMode || !{'ffmpegPath', 'ossutilPath', 'accessKeyId', 'accessKeySecret', 'securityToken'}.contains(field.$1))
+        .where(
+          (field) =>
+              !widget.demoMode ||
+              !{
+                'ffmpegPath',
+                'ossutilPath',
+                'accessKeyId',
+                'accessKeySecret',
+                'securityToken',
+              }.contains(field.$1),
+        )
         .where((field) => _showAdvanced || !_advancedKeys.contains(field.$1))
         .toList(growable: false);
     final specialCount = 6;
@@ -754,7 +1006,6 @@ class _PipelinePageState extends State<PipelinePage> {
                     !(_text('authorizationCode').isNotEmpty &&
                         const {
                           'bucket',
-                          'prefix',
                           'endpoint',
                           'accessKeyId',
                           'accessKeySecret',
@@ -813,7 +1064,7 @@ class _PipelinePageState extends State<PipelinePage> {
                     'workspacePath' => '本机临时空间，需要足够的磁盘容量',
                     'authorizationCode' => '粘贴服务方提供的一整段授权码即可',
                     'bucket' => '授权码模式下会自动填充',
-                    'prefix' => '可选；用于整理到 OSS 子目录',
+                    'prefix' => '可填写 OSS 子目录，例如：照片/2026/10；留空则使用授权码中的路径',
                     'uploadConcurrency' => '默认 10；网络和磁盘较快时可提高',
                     _ => null,
                   },

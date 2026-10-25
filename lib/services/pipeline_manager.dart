@@ -109,8 +109,11 @@ class PipelineManager {
     final runTimer = Stopwatch()..start();
     const copyWeight = 0.30;
     const transcodeWeight = 0.30;
-    final uploadWeight = config.deleteAfterUpload ? 0.35 : 0.40;
-    final cleanupWeight = config.deleteAfterUpload ? 0.05 : 0.0;
+    // 关闭转码时直接从源目录上传，不创建工作区；源盘内容绝不能被清理。
+    final directUpload = !config.transcodeEnabled;
+    final cleanupEnabled = config.deleteAfterUpload && !directUpload;
+    final uploadWeight = cleanupEnabled ? 0.35 : 0.40;
+    final cleanupWeight = cleanupEnabled ? 0.05 : 0.0;
     const transcodeStart = copyWeight;
     const uploadStart = copyWeight + transcodeWeight;
     final cleanupStart = uploadStart + uploadWeight;
@@ -184,59 +187,82 @@ class PipelineManager {
       // 相对路径导致 run 目录、相对对象 key 和清理目标不一致。
       final source = p.normalize(p.absolute(config.sourcePath));
       final workspace = p.normalize(p.absolute(config.workspacePath));
-      if (_sameOrNestedPath(source, workspace)) {
+      if (!directUpload && _sameOrNestedPath(source, workspace)) {
         throw ArgumentError('源目录与工作区不能相同或互相嵌套');
       }
       final runId = DateTime.now().toUtc().microsecondsSinceEpoch;
-      final runWorkspace = p.join(workspace, 'run_$runId');
+      final runWorkspace = directUpload
+          ? source
+          : p.join(workspace, 'run_$runId');
       report(
         '任务配置：源=$source，工作区=$workspace，目标=oss://${config.bucket}/${config.prefix}',
       );
       report(
         '并行参数：复制=${config.copyConcurrency}，转码=${config.transcodeConcurrency}，'
         '上传 jobs=${config.uploadConcurrency}，分片 parallel=${config.multipartParallel}，'
-        '模式=${config.bulkUpload ? '批量' : '逐文件'}，清理=${config.deleteAfterUpload ? '开启' : '关闭'}',
+        '模式=${config.bulkUpload ? '批量' : '逐文件'}，'
+        '数据来源=${directUpload ? '源目录直传（跳过复制）' : '本地工作区'}，'
+        '清理=${cleanupEnabled ? '开启' : '关闭'}',
       );
-      report('本次临时工作区：$runWorkspace');
-      update(PipelineStage.copying, 0, message: '扫描中，正在读取目录');
+      report(directUpload ? '直传源目录：$source' : '本次临时工作区：$runWorkspace');
       var copyCount = 0;
       final sourceFileSizes = <String, int>{};
-      final files = await _copy.copyTree(
-        source: source,
-        workspace: runWorkspace,
-        concurrency: config.copyConcurrency,
-        gate: gate,
-        log: report,
-        onTask: (name, value, status) => setTask(
-          'copy:$name',
-          name,
-          status == '复制中' ? null : value,
-          status,
-          emit: status != '已复制',
-        ),
-        onFileScanned: (relativePath, size) =>
-            sourceFileSizes[relativePath] = size,
-        onScan: (discovered, complete, totalBytes) {
-          if (complete) copyCount = discovered;
-          update(
-            PipelineStage.copying,
-            0,
-            total: complete ? discovered : 0,
-            message: complete
-                ? '已扫描 $discovered 个文件（${_formatBytes(totalBytes)}），准备复制'
-                : '扫描中，已发现 $discovered 个文件（${_formatBytes(totalBytes)}）',
-          );
-        },
-        progress: (value, detail, done, total) => update(
+      final files = directUpload
+          ? await _listFiles(
+              source,
+              gate: gate,
+              onProgress: (discovered) => update(
+                PipelineStage.copying,
+                copyWeight,
+                message: '直传模式扫描中，已发现 $discovered 个文件',
+              ),
+            )
+          : await _copy.copyTree(
+              source: source,
+              workspace: runWorkspace,
+              concurrency: config.copyConcurrency,
+              gate: gate,
+              log: report,
+              onTask: (name, value, status) => setTask(
+                'copy:$name',
+                name,
+                status == '复制中' ? null : value,
+                status,
+                emit: status != '已复制',
+              ),
+              onFileScanned: (relativePath, size) =>
+                  sourceFileSizes[relativePath] = size,
+              onScan: (discovered, complete, totalBytes) {
+                if (complete) copyCount = discovered;
+                update(
+                  PipelineStage.copying,
+                  0,
+                  total: complete ? discovered : 0,
+                  message: complete
+                      ? '已扫描 $discovered 个文件（${_formatBytes(totalBytes)}），准备复制'
+                      : '扫描中，已发现 $discovered 个文件（${_formatBytes(totalBytes)}）',
+                );
+              },
+              progress: (value, detail, done, total) => update(
+                PipelineStage.copying,
+                value * copyWeight,
+                file: null,
+                name: detail.isEmpty ? _snapshot.currentFile : detail,
+                done: done,
+                total: total == 0 ? copyCount : total,
+                message: '已复制 $done/$total 个文件',
+              ),
+            );
+      if (directUpload) {
+        copyCount = files.length;
+        update(
           PipelineStage.copying,
-          value * copyWeight,
-          file: null,
-          name: detail.isEmpty ? _snapshot.currentFile : detail,
-          done: done,
-          total: total == 0 ? copyCount : total,
-          message: '已复制 $done/$total 个文件',
-        ),
-      );
+          copyWeight,
+          total: copyCount,
+          done: copyCount,
+          message: '已关闭转码，跳过本地复制，准备直接上传',
+        );
+      }
       final ext = config.videoExtensions.map((e) => e.toLowerCase()).toSet();
       // 转码是可选步骤。关闭时保留原始视频，后续仍会随工作区文件一起上传。
       final videos = config.transcodeEnabled
@@ -734,7 +760,7 @@ class PipelineManager {
         if (gate.cancelled) throw const PipelineCancelledException();
         if (uploadFailure != null) throw uploadFailure!;
       }
-      if (config.deleteAfterUpload) {
+      if (cleanupEnabled) {
         await gate.checkpoint();
         taskStates.clear();
         update(PipelineStage.cleaning, cleanupStart, message: '清理工作区');

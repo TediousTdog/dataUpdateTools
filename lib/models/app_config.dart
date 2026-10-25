@@ -167,13 +167,13 @@ class AppConfig {
 
   String toPrettyJson() => const JsonEncoder.withIndent('  ').convert(toJson());
 
-  /// 新格式授权码优先；为空时继续兼容旧版手工填写的 OSS 配置。
+  /// 新格式授权码提供连接默认值；用户填写的 OSS 前缀始终优先。
   AppConfig resolveAuthorization() {
     if (authorizationCode.trim().isEmpty) return this;
     final authorization = OssAuthorization.parse(authorizationCode);
     return copyWith(
       bucket: authorization.bucket,
-      prefix: authorization.prefix,
+      prefix: prefix.trim().isNotEmpty ? prefix.trim() : authorization.prefix,
       endpoint: authorization.endpoint,
       accessKeyId: authorization.accessKeyId,
       accessKeySecret: authorization.accessKeySecret,

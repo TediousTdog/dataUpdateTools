@@ -8,6 +8,61 @@ class OssService {
   OssService(this.runner);
   final ProcessRunner runner;
 
+  /// 读取 OSS 原目录的对象列表，供左侧路径浏览器使用。
+  ///
+  /// 采用独立 argv 调用 ossutil，不经过 shell；因此 Bucket 前缀中的中文、
+  /// 空格和特殊字符不会被命令行重新编码。不同 ossutil 版本对列表输出格式
+  /// 略有差异，UI 保留原始行以便排查。
+  Future<List<String>> listPrefix({
+    required AppConfig config,
+    int maxLines = 200,
+    void Function(String line)? onLog,
+  }) async {
+    final effective = config.resolveAuthorization();
+    if (effective.bucket.trim().isEmpty) {
+      throw ArgumentError('OSS Bucket 不能为空');
+    }
+    if (effective.endpoint.trim().isEmpty) {
+      throw ArgumentError('OSS Endpoint 不能为空');
+    }
+    if (effective.accessKeyId.trim().isEmpty ||
+        effective.accessKeySecret.trim().isEmpty) {
+      throw ArgumentError('OSS AccessKey ID/Secret 不能为空');
+    }
+    final prefix = _cleanPrefix(effective.prefix);
+    final destination =
+        'oss://${effective.bucket}/${prefix.isEmpty ? '' : '$prefix/'}';
+    final lines = <String>[];
+    final args = <String>[
+      '-e',
+      effective.endpoint,
+      '-i',
+      effective.accessKeyId,
+      '-k',
+      effective.accessKeySecret,
+      if (effective.securityToken.trim().isNotEmpty) ...[
+        '-t',
+        effective.securityToken,
+      ],
+      'ls',
+      '-r',
+      destination,
+    ];
+    final code = await runner.run(
+      executable: effective.ossutilPath,
+      arguments: args,
+      log: onLog ?? (_) {},
+      onStdout: (line) {
+        if (lines.length < maxLines && line.trim().isNotEmpty) lines.add(line);
+      },
+      onStderr: (line) {
+        onLog?.call(line);
+      },
+    );
+    if (code != 0) throw StateError('读取 OSS 目录失败，退出码 $code');
+    return lines;
+  }
+
   /// 构造单文件上传参数。参数始终以独立 argv 传给 ossutil，不经过 cmd.exe，
   /// 所以 Windows 路径中的空格、中文和括号都不会被 shell 二次解析。
   List<String> buildUploadArguments(
