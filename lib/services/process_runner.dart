@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:path/path.dart' as p;
 import 'pipeline_types.dart';
 
 /// 持有当前子进程，取消流水线时可立即结束正在运行的工具。
@@ -16,10 +17,11 @@ class ProcessRunner {
     void Function(String line)? onStderr,
   }) async {
     final generation = _cancelGeneration;
+    final resolvedExecutable = resolveProcessExecutable(executable);
     // 不经 shell，arguments 中的每个元素都是独立参数，因此空格路径无需手工加引号。
-    // Windows Dart runtime 会以非交互子进程方式创建进程；这里不使用 runInShell。
+    // 相对工具路径先按 exe 所在目录解析，避免双击启动时受进程当前目录影响。
     final process = await Process.start(
-      executable,
+      resolvedExecutable,
       arguments,
       runInShell: false,
       mode: ProcessStartMode.normal,
@@ -94,6 +96,34 @@ class ProcessRunner {
     }
     _active.clear();
   }
+}
+
+/// 解析外部工具路径。发布包将 tools/ 放在应用 exe 旁；开发运行时，
+/// Flutter runner 的 exe 通常位于 build/ 子目录，因此再回退项目当前目录。
+/// 绝对路径保持原样，未配置路径部分的裸命令仍交由系统搜索（例如 explorer.exe）。
+String resolveProcessExecutable(String executable) {
+  final context = p.Context(
+    style: Platform.isWindows ? p.Style.windows : p.Style.posix,
+  );
+  if (context.isAbsolute(executable)) return context.normalize(executable);
+
+  final executableDirectory = context.dirname(Platform.resolvedExecutable);
+  final besideExecutable = context.normalize(
+    context.join(executableDirectory, executable),
+  );
+  if (File(besideExecutable).existsSync()) return besideExecutable;
+
+  final besideCurrentDirectory = context.normalize(
+    context.absolute(executable),
+  );
+  if (File(besideCurrentDirectory).existsSync()) {
+    return besideCurrentDirectory;
+  }
+
+  final hasDirectory = executable.contains('/') || executable.contains('\\');
+  // 对带目录的工具路径返回稳定、可诊断的绝对路径，而非依赖 Process.start
+  // 的当前目录解析；裸命令则保留名称，让操作系统按 PATH 规则查找。
+  return hasDirectory ? besideExecutable : executable;
 }
 
 StreamTransformer<List<int>, String> _adaptiveLineDecoder() {

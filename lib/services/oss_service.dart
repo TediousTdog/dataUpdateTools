@@ -8,7 +8,55 @@ class OssService {
   OssService(this.runner);
   final ProcessRunner runner;
 
-  /// 读取 OSS 原目录的对象列表，供左侧路径浏览器使用。
+  /// 将选中的 OSS 对象下载到本地目录。目标文件名从对象 key 获取，
+  /// 不经过 shell，包含空格/中文的本地路径也由独立 argv 安全传递。
+  Future<void> downloadObject({
+    required AppConfig config,
+    required String objectKey,
+    required String localDirectory,
+    void Function(String line)? onLog,
+  }) async {
+    final effective = config.resolveAuthorization();
+    if (effective.bucket.trim().isEmpty || effective.endpoint.trim().isEmpty) {
+      throw ArgumentError('OSS Bucket 和 Endpoint 不能为空');
+    }
+    if (effective.accessKeyId.trim().isEmpty ||
+        effective.accessKeySecret.trim().isEmpty) {
+      throw ArgumentError('OSS AccessKey ID/Secret 不能为空');
+    }
+    final key = objectKey.replaceAll(RegExp(r'^/+'), '');
+    if (key.isEmpty || key.endsWith('/')) {
+      throw ArgumentError('请选择一个文件对象，而不是目录');
+    }
+    final directory = Directory(localDirectory);
+    await directory.create(recursive: true);
+    final filename = key.split('/').last;
+    final target = p.join(directory.path, filename);
+    final args = <String>[
+      '-e',
+      effective.endpoint,
+      '-i',
+      effective.accessKeyId,
+      '-k',
+      effective.accessKeySecret,
+      if (effective.securityToken.trim().isNotEmpty) ...[
+        '-t',
+        effective.securityToken,
+      ],
+      'cp',
+      'oss://${effective.bucket}/$key',
+      target,
+      ..._splitExtra(effective.ossExtraArgs),
+    ];
+    final code = await runner.run(
+      executable: effective.ossutilPath,
+      arguments: args,
+      log: onLog ?? (_) {},
+    );
+    if (code != 0) throw StateError('OSS 下载失败，退出码 $code');
+  }
+
+  /// 读取当前 OSS 前缀的目录列表，供文件管理器逐级浏览。
   ///
   /// 采用独立 argv 调用 ossutil，不经过 shell；因此 Bucket 前缀中的中文、
   /// 空格和特殊字符不会被命令行重新编码。不同 ossutil 版本对列表输出格式
@@ -45,7 +93,6 @@ class OssService {
         effective.securityToken,
       ],
       'ls',
-      '-r',
       destination,
     ];
     final code = await runner.run(

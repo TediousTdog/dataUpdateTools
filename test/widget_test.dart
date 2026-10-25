@@ -9,7 +9,7 @@ import 'package:untitled/services/pipeline_manager.dart';
 import 'package:untitled/services/pipeline_types.dart';
 
 void main() {
-  testWidgets('dashboard shows pipeline controls and log viewer', (
+  testWidgets('workspace exposes separate browser, upload and log pages', (
     tester,
   ) async {
     final temp = await Directory.systemTemp.createTemp('media_ingest_widget_');
@@ -30,8 +30,15 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
 
     expect(find.text('媒体归档工作台'), findsOneWidget);
+    expect(find.text('OSS 文件'), findsOneWidget);
+    expect(find.text('上传任务'), findsOneWidget);
+    expect(find.text('下载文件'), findsOneWidget);
+    await tester.tap(find.widgetWithText(TextButton, '上传任务'));
+    await tester.pump(const Duration(milliseconds: 50));
     expect(find.text('开始任务'), findsOneWidget);
     expect(find.text('总体进度'), findsOneWidget);
+    await tester.tap(find.widgetWithText(TextButton, '运行日志'));
+    await tester.pump(const Duration(milliseconds: 50));
     expect(find.textContaining('运行日志'), findsOneWidget);
     expect(find.text('搜索当前日志'), findsOneWidget);
     expect(find.text('警告'), findsOneWidget);

@@ -70,6 +70,10 @@ class _PipelinePageState extends State<PipelinePage> {
   bool _ossListing = false;
   List<String> _ossEntries = const [];
   String? _ossListingError;
+  String _activeSection = 'browser';
+  String? _selectedObjectKey;
+  bool _downloading = false;
+  bool _authRequired = false;
 
   static const _advancedKeys = <String>{
     'endpoint',
@@ -174,7 +178,14 @@ class _PipelinePageState extends State<PipelinePage> {
     for (final (key, _, _) in _fields) {
       _controllers[key] = TextEditingController(text: _value(_config, key));
     }
+    _authRequired =
+        _config.authorizationCode.trim().isEmpty &&
+        (_config.accessKeyId.isEmpty || _config.accessKeySecret.isEmpty);
     if (mounted) setState(() => _loading = false);
+    if (mounted &&
+        (_text('authorizationCode').isNotEmpty || _text('bucket').isNotEmpty)) {
+      unawaited(_refreshOssListing());
+    }
   }
 
   String _value(AppConfig c, String key) => switch (key) {
@@ -320,6 +331,112 @@ class _PipelinePageState extends State<PipelinePage> {
       _append('OSS 原目录读取失败：$error');
     } finally {
       if (mounted) setState(() => _ossListing = false);
+    }
+  }
+
+  Future<void> _switchAuthorization() async {
+    if (_manager.running || _starting) return;
+    final controller = TextEditingController(text: _text('authorizationCode'));
+    final code = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('切换 OSS 授权码'),
+        content: SizedBox(
+          width: 560,
+          child: TextField(
+            controller: controller,
+            minLines: 3,
+            maxLines: 6,
+            decoration: const InputDecoration(
+              labelText: '粘贴新的授权码',
+              helperText: '授权码会保存在本机配置中；不要分享给他人。',
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () {
+              try {
+                OssAuthorization.parse(controller.text);
+                Navigator.pop(dialogContext, controller.text.trim());
+              } on FormatException catch (error) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('授权码无效：${error.message}')),
+                );
+              }
+            },
+            child: const Text('验证并切换'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (!mounted || code == null) return;
+    await _applyAuthorizationCode(code);
+  }
+
+  Future<void> _applyAuthorizationCode(String code) async {
+    try {
+      OssAuthorization.parse(code);
+    } on FormatException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('授权码无效：${error.message}')));
+      }
+      return;
+    }
+    _controllers['authorizationCode']?.text = code;
+    _controllers['prefix']?.clear();
+    _selectedObjectKey = null;
+    try {
+      await _save();
+      if (!mounted) return;
+      setState(() {
+        _activeSection = 'browser';
+        _authRequired = false;
+      });
+      await _refreshOssListing();
+    } catch (_) {
+      // _save 已通过现有错误提示显示失败原因。
+    }
+  }
+
+  Future<void> _downloadSelectedObject() async {
+    final key = _selectedObjectKey;
+    if (key == null || _downloading) return;
+    final directory = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: '选择下载保存位置',
+      lockParentWindow: true,
+    );
+    if (!mounted || directory == null) return;
+    setState(() => _downloading = true);
+    try {
+      await _ossBrowser.downloadObject(
+        config: _readForm(),
+        objectKey: key,
+        localDirectory: directory,
+        onLog: (line) => _append('[OSS 下载] $line'),
+      );
+      _append('下载完成：$key → $directory');
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('文件下载完成')));
+      }
+    } catch (error) {
+      _append('下载失败：$error');
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('下载失败：$error')));
+      }
+    } finally {
+      if (mounted) setState(() => _downloading = false);
     }
   }
 
@@ -612,6 +729,11 @@ class _PipelinePageState extends State<PipelinePage> {
           ],
         ),
         actions: [
+          _sectionButton('browser', 'OSS 文件', Icons.folder_open_outlined),
+          _sectionButton('upload', '上传任务', Icons.cloud_upload_outlined),
+          _sectionButton('download', '下载文件', Icons.download_outlined),
+          _sectionButton('settings', '设置', Icons.settings_outlined),
+          _sectionButton('logs', '运行日志', Icons.article_outlined),
           IconButton(
             tooltip: '文件对齐与分组整理',
             onPressed: busy
@@ -624,33 +746,383 @@ class _PipelinePageState extends State<PipelinePage> {
             icon: const Icon(Icons.fact_check_outlined),
           ),
           IconButton(
-            tooltip: '保存配置',
-            onPressed: busy ? null : _save,
-            icon: const Icon(Icons.save_outlined),
+            tooltip: '切换授权码',
+            onPressed: busy ? null : _switchAuthorization,
+            icon: const Icon(Icons.key_outlined),
           ),
         ],
       ),
       body: Padding(
         padding: const EdgeInsets.all(20),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            SizedBox(width: 270, child: _locationPanel()),
-            const SizedBox(width: 16),
+        child: _authRequired && !widget.demoMode
+            ? _authorizationEntryPage()
+            : switch (_activeSection) {
+                'browser' => _browserPage(),
+                'upload' => _uploadPage(),
+                'download' => _downloadPage(),
+                'settings' => _settingsPage(),
+                'logs' => _logPanel(),
+                _ => _browserPage(),
+              },
+      ),
+    );
+  }
+
+  Widget _sectionButton(String section, String label, IconData icon) {
+    final active = _activeSection == section;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: TextButton.icon(
+        onPressed: () => setState(() => _activeSection = section),
+        icon: Icon(icon, size: 18),
+        label: Text(label),
+        style: TextButton.styleFrom(
+          backgroundColor: active
+              ? Theme.of(context).colorScheme.secondaryContainer
+              : null,
+          foregroundColor: active
+              ? Theme.of(context).colorScheme.onSecondaryContainer
+              : null,
+        ),
+      ),
+    );
+  }
+
+  Widget _authorizationEntryPage() => Center(
+    child: ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 620),
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Icon(Icons.cloud_circle_outlined, size: 56),
+              const SizedBox(height: 14),
+              Text(
+                '连接阿里云 OSS',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.headlineSmall,
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '粘贴服务方提供的授权码，即可直接进入授权码对应的 OSS 路径。',
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 20),
+              TextField(
+                controller: _controllers['authorizationCode'],
+                minLines: 3,
+                maxLines: 5,
+                decoration: const InputDecoration(
+                  labelText: 'OSS 授权码',
+                  hintText: '粘贴完整授权码（Base64 JSON）',
+                  helperText: '授权信息仅保存在本机配置文件中。',
+                ),
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                _authorizationPreview(),
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: _authorizationPreview().startsWith('授权码无效')
+                      ? Theme.of(context).colorScheme.error
+                      : Theme.of(context).colorScheme.primary,
+                ),
+              ),
+              const SizedBox(height: 14),
+              FilledButton.icon(
+                onPressed: _text('authorizationCode').isEmpty
+                    ? null
+                    : () => _applyAuthorizationCode(_text('authorizationCode')),
+                icon: const Icon(Icons.login),
+                label: const Text('验证并进入 OSS'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+
+  Widget _browserPage() => Row(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      SizedBox(width: 390, child: _locationPanel()),
+      const SizedBox(width: 16),
+      Expanded(child: _ossExplorerPanel()),
+    ],
+  );
+
+  Widget _settingsPage() => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      Row(
+        children: [
+          Text('设置', style: Theme.of(context).textTheme.titleLarge),
+          const Spacer(),
+          OutlinedButton.icon(
+            onPressed: _manager.running || _starting ? null : _save,
+            icon: const Icon(Icons.save_outlined),
+            label: const Text('保存设置'),
+          ),
+        ],
+      ),
+      const SizedBox(height: 12),
+      Expanded(child: _configPanel()),
+    ],
+  );
+
+  Widget _uploadPage() => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      Text('上传任务', style: Theme.of(context).textTheme.titleLarge),
+      const SizedBox(height: 12),
+      Expanded(child: _progressPanel()),
+    ],
+  );
+
+  Widget _downloadPage() => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      Row(
+        children: [
+          Expanded(
+            child: Text('下载文件', style: Theme.of(context).textTheme.titleLarge),
+          ),
+          FilledButton.icon(
+            onPressed: _selectedObjectKey == null || _downloading
+                ? null
+                : _downloadSelectedObject,
+            icon: _downloading
+                ? const SizedBox.square(
+                    dimension: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.download),
+            label: Text(_downloading ? '正在下载…' : '下载选中文件'),
+          ),
+        ],
+      ),
+      const SizedBox(height: 8),
+      Text(
+        _selectedObjectKey == null
+            ? '请先到“OSS 文件”页面选择一个文件对象。支持任意文件类型。'
+            : '已选择：$_selectedObjectKey',
+      ),
+      const SizedBox(height: 12),
+      Expanded(child: _ossExplorerPanel()),
+    ],
+  );
+
+  List<({String name, String? key, bool directory, String raw})>
+  _visibleOssItems() {
+    AppConfig effective;
+    try {
+      effective = _readForm().resolveAuthorization();
+    } on FormatException {
+      return _ossEntries
+          .map((line) => (name: line, key: null, directory: false, raw: line))
+          .toList();
+    }
+    final bucket = effective.bucket;
+    final current = effective.prefix.replaceAll(RegExp(r'^/+|/+$'), '');
+    final children = <String, ({String? key, bool directory, String raw})>{};
+    final objectPattern = RegExp(r'oss://([^/\s]+)/([^\s]*)');
+    for (final line in _ossEntries) {
+      final match = objectPattern.firstMatch(line);
+      if (match == null || match.group(1) != bucket) continue;
+      var key = match.group(2)!.replaceAll(RegExp(r'[,;]+$'), '');
+      try {
+        key = Uri.decodeComponent(key);
+      } on ArgumentError {
+        // 对象名可能包含未编码的百分号，原样保留即可继续浏览。
+      }
+      final directoryMarker = key.endsWith('/');
+      final normalized = key.replaceAll(RegExp(r'^/+|/+$'), '');
+      final remainder = current.isEmpty
+          ? normalized
+          : normalized.startsWith('$current/')
+          ? normalized.substring(current.length + 1)
+          : '';
+      if (remainder.isEmpty) continue;
+      final slash = remainder.indexOf('/');
+      if (slash >= 0) {
+        final name = remainder.substring(0, slash);
+        final childKey = [if (current.isNotEmpty) current, name].join('/');
+        children[name] = (key: childKey, directory: true, raw: line);
+      } else if (directoryMarker) {
+        final name = remainder;
+        children[name] = (key: normalized, directory: true, raw: line);
+      } else {
+        final name = remainder;
+        children.putIfAbsent(
+          name,
+          () => (key: normalized, directory: false, raw: line),
+        );
+      }
+    }
+    final items =
+        children.entries
+            .map(
+              (entry) => (
+                name: entry.key,
+                key: entry.value.key,
+                directory: entry.value.directory,
+                raw: entry.value.raw,
+              ),
+            )
+            .toList()
+          ..sort((a, b) {
+            if (a.directory != b.directory) return a.directory ? -1 : 1;
+            return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+          });
+    return items;
+  }
+
+  Future<void> _openOssFolder(String key) async {
+    _controllers['prefix']?.text = key;
+    _selectedObjectKey = null;
+    setState(() {});
+    await _refreshOssListing();
+  }
+
+  Future<void> _goOssParent() async {
+    final effective = _readForm().resolveAuthorization();
+    final current = effective.prefix.replaceAll(RegExp(r'^/+|/+$'), '');
+    final authRoot = _text('authorizationCode').isEmpty
+        ? ''
+        : OssAuthorization.parse(_text('authorizationCode')).prefix;
+    if (current == authRoot || current.isEmpty) return;
+    final parent = current.contains('/')
+        ? current.substring(0, current.lastIndexOf('/'))
+        : authRoot;
+    await _openOssFolder(parent);
+  }
+
+  Widget _ossExplorerPanel() {
+    AppConfig? effective;
+    try {
+      effective = _readForm().resolveAuthorization();
+    } on FormatException {
+      effective = null;
+    }
+    final path = effective == null
+        ? '请先输入有效授权码'
+        : 'oss://${effective.bucket}/${effective.prefix.isEmpty ? '' : '${effective.prefix}/'}';
+    final items = _visibleOssItems();
+    return Card(
+      elevation: 0,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(18, 12, 8, 8),
+            child: Row(
+              children: [
+                IconButton(
+                  tooltip: '返回上级文件夹',
+                  onPressed: _ossListing || effective == null
+                      ? null
+                      : _goOssParent,
+                  icon: const Icon(Icons.arrow_upward),
+                ),
+                const Icon(Icons.cloud_outlined),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    path,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                IconButton(
+                  tooltip: '刷新当前文件夹',
+                  onPressed: effective == null ? null : _refreshOssListing,
+                  icon: const Icon(Icons.refresh),
+                ),
+                IconButton(
+                  tooltip: '选择当前文件夹作为上传目标',
+                  onPressed: effective == null
+                      ? null
+                      : () {
+                          ScaffoldMessenger.of(
+                            context,
+                          ).showSnackBar(SnackBar(content: Text('上传目标：$path')));
+                        },
+                  icon: const Icon(Icons.check_circle_outline),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          if (_ossListingError != null)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                _ossListingError!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            )
+          else if (_ossListing)
+            const Expanded(child: Center(child: CircularProgressIndicator()))
+          else if (effective == null)
+            const Expanded(child: Center(child: Text('使用右上角“切换授权码”进入 OSS')))
+          else if (items.isEmpty)
+            const Expanded(child: Center(child: Text('此文件夹为空，或尚未刷新目录')))
+          else
             Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Expanded(flex: 6, child: _configPanel()),
-                  const SizedBox(height: 16),
-                  _progressPanel(),
-                  const SizedBox(height: 16),
-                  Expanded(flex: 4, child: _logPanel()),
-                ],
+              child: ListView.separated(
+                itemCount: items.length,
+                separatorBuilder: (_, _) =>
+                    const Divider(height: 1, indent: 56),
+                itemBuilder: (context, index) {
+                  final item = items[index];
+                  final selected =
+                      item.key != null && item.key == _selectedObjectKey;
+                  return ListTile(
+                    selected: selected,
+                    leading: Icon(
+                      item.directory
+                          ? Icons.folder_outlined
+                          : Icons.insert_drive_file_outlined,
+                    ),
+                    title: Text(
+                      item.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: item.directory
+                        ? const Text('文件夹')
+                        : Text(
+                            item.raw,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                    trailing: item.directory
+                        ? const Icon(Icons.chevron_right)
+                        : selected
+                        ? const Icon(Icons.check_circle)
+                        : null,
+                    onTap: item.key == null
+                        ? null
+                        : item.directory
+                        ? () => _openOssFolder(item.key!)
+                        : () => setState(() => _selectedObjectKey = item.key),
+                  );
+                },
               ),
             ),
-          ],
-        ),
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Text(
+              '${items.where((item) => item.directory).length} 个文件夹 · '
+              '${items.where((item) => !item.directory).length} 个文件（不限格式）',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
+        ],
       ),
     );
   }

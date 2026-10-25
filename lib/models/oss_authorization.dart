@@ -30,58 +30,107 @@ class OssAuthorization {
   /// 因此中文、空格和 Windows 反斜杠不会被 shell 或本地路径规则改写。
   factory OssAuthorization.parse(String input) {
     late final dynamic value;
-    try {
-      final trimmed = input.trim();
-      if (trimmed.startsWith('{')) {
+    final trimmed = input.trim();
+    if (trimmed.isEmpty) throw const FormatException('授权码不能为空');
+    if (trimmed.startsWith('{')) {
+      try {
         value = jsonDecode(trimmed);
-      } else {
-        final compact = trimmed
-            .replaceFirst(RegExp(r'^data:.*?;base64,'), '')
-            .replaceAll(RegExp(r'\s+'), '');
-        if (compact.isEmpty) throw const FormatException('授权码不能为空');
-        final base64Text = compact.replaceAll('-', '+').replaceAll('_', '/');
-        if (base64Text.length % 4 == 1) {
-          throw const FormatException('授权码不是有效的 Base64 内容');
+      } on FormatException {
+        throw const FormatException('授权码看起来是 JSON，但 JSON 格式不正确');
+      }
+    } else {
+      // 复制时偶尔会把整段授权码用引号括住，或在末尾混入网页百分号标记。
+      // 只剥离两端包裹符，不从中间任意删除字符，避免悄悄改变凭证。
+      var candidate = trimmed;
+      const wrappers = ['"', "'", '`', '“', '”', '‘', '’'];
+      for (final wrapper in wrappers) {
+        if (candidate.startsWith(wrapper) && candidate.endsWith(wrapper)) {
+          candidate = candidate.substring(
+            wrapper.length,
+            candidate.length - wrapper.length,
+          );
+          break;
         }
-        final padded = base64Text.padRight(
-          base64Text.length + ((4 - base64Text.length % 4) % 4),
-          '=',
-        );
-        final decoded = utf8
+      }
+      final compact = candidate
+          .replaceFirst(RegExp(r'^data:.*?;base64,'), '')
+          .replaceAll(RegExp(r'\s+'), '');
+      // 有些复制源会在授权码末尾附加一个百分号作为界面标记；它不是
+      // Base64 数据。仅容忍尾部的百分号，其他非法字符仍明确报错。
+      final base64Text = compact
+          .replaceFirst(RegExp(r'%+$'), '')
+          .replaceAll('-', '+')
+          .replaceAll('_', '/');
+      if (base64Text.length % 4 == 1 ||
+          !RegExp(r'^[A-Za-z0-9+/]*={0,2}$').hasMatch(base64Text) ||
+          (base64Text.contains('=') && base64Text.length % 4 != 0)) {
+        throw const FormatException('授权码不是有效的 Base64。请粘贴完整授权码，不要包含引号或说明文字');
+      }
+      final padded = base64Text.padRight(
+        base64Text.length + ((4 - base64Text.length % 4) % 4),
+        '=',
+      );
+      late final String decoded;
+      try {
+        decoded = utf8
             .decode(base64.decode(padded), allowMalformed: false)
             .replaceFirst('\ufeff', '');
-        value = jsonDecode(decoded);
+      } on FormatException {
+        throw const FormatException('Base64 内容不是有效的 UTF-8 文本；请确认授权码复制完整');
       }
-    } on Object {
-      // 不把原文或解码后的内容放进异常，避免凭证被日志意外记录。
-      throw const FormatException('授权码无法解码，请确认复制完整且为 UTF-8 JSON');
+      try {
+        value = jsonDecode(decoded);
+      } on FormatException {
+        // 不展示解码文本，因为其中可能包含 AccessKey Secret。
+        throw const FormatException(
+          'Base64 已解码，但内容不是合法 JSON。请确认授权码由完整 JSON 按 UTF-8 编码后生成',
+        );
+      }
     }
     if (value is! Map) {
       throw const FormatException('授权码内容必须是 JSON 对象');
     }
     final json = Map<String, dynamic>.from(value);
 
-    String field(List<String> names) {
-      for (final name in names) {
-        final value = json[name];
-        if (value is String && value.trim().isNotEmpty) return value.trim();
+    // 兼容网页授权码 JSON 与从 batch 配置整理出来的 JSON 字段名。
+    String fieldAnyCase(List<String> names) {
+      final wanted = names.map((name) => name.toLowerCase()).toSet();
+      for (final entry in json.entries) {
+        if (wanted.contains(entry.key.toString().toLowerCase()) &&
+            entry.value is String &&
+            (entry.value as String).trim().isNotEmpty) {
+          return (entry.value as String).trim();
+        }
       }
       return '';
     }
 
-    final accessKeyId = field(['accessKeyId', 'access_key_id', 'id']);
-    final accessKeySecret = field([
+    final accessKeyId = fieldAnyCase([
+      'accessKeyId',
+      'access_key_id',
+      'id',
+      'OSS_ACCESS_KEY_ID',
+    ]);
+    final accessKeySecret = fieldAnyCase([
       'accessKeySecret',
       'access_key_secret',
       'secret',
+      'OSS_ACCESS_KEY_SECRET',
     ]);
-    final region = field(['region']);
-    final endpoint = field([
+    final region = fieldAnyCase(['region', 'OSS_REGION']);
+    final endpoint = fieldAnyCase([
       'endpoint',
       'eptpl', // 部分 OSS 浏览器授权码使用此字段名。
       'endpointTemplate',
+      'OSS_ENDPOINT',
+    ]).replaceAll(RegExp(r'\s+'), '');
+    final ossPath = fieldAnyCase([
+      'osspath',
+      'ossPath',
+      'path',
+      'bucketPath',
+      'OSS_ROOT',
     ]);
-    final ossPath = field(['osspath', 'ossPath', 'path', 'bucketPath']);
     final uri = _parseOssPath(ossPath);
     if (accessKeyId.isEmpty || accessKeySecret.isEmpty) {
       throw const FormatException('授权码缺少 AccessKey ID 或 Secret');
@@ -103,8 +152,8 @@ class OssAuthorization {
       endpoint: resolvedEndpoint,
       bucket: uri.$1,
       prefix: uri.$2,
-      securityToken: field(['securityToken', 'security_token', 'token']),
-      description: field(['desc', 'description']),
+      securityToken: fieldAnyCase(['securityToken', 'security_token', 'token']),
+      description: fieldAnyCase(['desc', 'description']),
     );
   }
 

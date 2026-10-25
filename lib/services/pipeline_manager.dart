@@ -932,14 +932,7 @@ class PipelineManager {
   }
 
   String _resolveTool(String path) {
-    if (p.isAbsolute(path)) return p.normalize(path);
-    // 发布包优先从 exe 同级目录查找；开发模式下再回退到当前工作目录，
-    // 这样把 tools/ 放在项目根目录即可直接 `flutter run -d windows` 调试。
-    final besideExecutable = p.normalize(
-      p.join(p.dirname(Platform.resolvedExecutable), path),
-    );
-    if (File(besideExecutable).existsSync()) return besideExecutable;
-    return p.normalize(p.absolute(path));
+    return resolveProcessExecutable(path);
   }
 
   bool _sameOrNestedPath(String first, String second) {
