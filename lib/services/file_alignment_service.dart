@@ -130,7 +130,7 @@ class FileAlignmentService {
   }
 
   String _cellText(Data? cell) => switch (cell?.value) {
-    TextCellValue value => value.value,
+    TextCellValue value => value.value.text ?? value.toString(),
     IntCellValue value => '${value.value}',
     DoubleCellValue value => '${value.value}',
     BoolCellValue value => '${value.value}',
