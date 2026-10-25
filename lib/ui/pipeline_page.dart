@@ -12,6 +12,7 @@ import '../services/pipeline_types.dart';
 import '../services/demo_pipeline_manager.dart';
 import '../services/oss_service.dart';
 import '../services/process_runner.dart';
+import 'file_alignment_page.dart';
 
 class PipelinePage extends StatefulWidget {
   const PipelinePage({
@@ -611,6 +612,17 @@ class _PipelinePageState extends State<PipelinePage> {
           ],
         ),
         actions: [
+          IconButton(
+            tooltip: '文件对齐与分组整理',
+            onPressed: busy
+                ? null
+                : () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const FileAlignmentPage(),
+                    ),
+                  ),
+            icon: const Icon(Icons.fact_check_outlined),
+          ),
           IconButton(
             tooltip: '保存配置',
             onPressed: busy ? null : _save,

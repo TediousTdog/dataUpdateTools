@@ -23,6 +23,7 @@ class PhotoIngestApp extends StatelessWidget {
   final ConfigRepository? configRepository;
   final LogStore? logStore;
   final PipelineManager? pipelineManager;
+
   /// macOS 演示默认开启；传入值可在测试或正式构建中覆盖。
   final bool? demoMode;
 
